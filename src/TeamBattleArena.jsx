@@ -5,6 +5,8 @@ import { BUILTIN_MAPS, resolveWallCollision, isBulletBlocked } from './mapSystem
 import MapRenderer from './MapRenderer'
 import { canSeeEnemy, markShooterRevealed, shapeOutgoingVisibility } from './useMapVisibility'
 import MatchCountdown from './MatchCountdown'
+import useGameControls from './useGameControls'
+import MobileControlsOverlay from './MobileControlsOverlay'
 
 /* =====================================================
    TEAM BATTLE V1 — 🔴 RED vs 🔵 BLUE
@@ -28,8 +30,6 @@ import MatchCountdown from './MatchCountdown'
 
 const HIT_RADIUS = 20
 const STATE_BROADCAST_MS = 70
-const SPRINT_DURATION_MS = 500
-const SPRINT_COOLDOWN_MS = 1000
 const OTHER_LERP = 0.25
 const RESPAWN_MS = 3000
 const SPAWN_PROTECTION_MS = 2000
@@ -119,7 +119,7 @@ function TeamFighterAvatar({ x, y, angle, color, emoji, isSelf, isProtected, isF
 /* =====================================================
    Team Battle 核心组件
 ===================================================== */
-export default function TeamBattleArena({ room, players, warrior, session, onBack, map, onMatchEnd }) {
+export default function TeamBattleArena({ room, players, warrior, session, onBack, map, onMatchEnd, mapScale }) {
   const myId = session.user.id
   const isHost = room?.host_id === myId
   const activeMap = map || room?.map_data || BUILTIN_MAPS[0]
@@ -128,7 +128,7 @@ export default function TeamBattleArena({ room, players, warrior, session, onBac
 
   // 地图永远居中显示在屏幕正中间，不跟随玩家移动。
   // 只在窗口大小变化时重新计算一次偏移量，不需要每帧更新。
-  const MAP_SCALE = 0.7
+  const MAP_SCALE = mapScale ?? 0.7
   const [mapOffset, setMapOffset] = useState({ x: 0, y: 0 })
   const mapOffsetRef = useRef({ x: 0, y: 0 })
 
@@ -144,7 +144,7 @@ export default function TeamBattleArena({ room, players, warrior, session, onBac
     computeOffset()
     window.addEventListener('resize', computeOffset)
     return () => window.removeEventListener('resize', computeOffset)
-  }, [mapPxW, mapPxH])
+  }, [mapPxW, mapPxH, MAP_SCALE])
   // 队伍完全由 battle_room_players.team 决定（1=RED / 2=BLUE），
   // 不再看加入顺序。RoomPage 已经保证了两边都至少 1 人才能开局。
   const orderedPlayers = players
@@ -207,7 +207,6 @@ export default function TeamBattleArena({ room, players, warrior, session, onBac
   const [skillState, setSkillState] = useState({ active: false, until: 0, type: null })
   const [skillCooldownUntil, setSkillCooldownUntil] = useState(0)
   const [flash, setFlash] = useState(null)
-  const [isSprinting, setIsSprinting] = useState(false)
 
   const [teamScore, setTeamScore] = useState({ RED: 0, BLUE: 0 })
   const teamScoreRef = useRef({ RED: 0, BLUE: 0 })
@@ -236,13 +235,7 @@ export default function TeamBattleArena({ room, players, warrior, session, onBac
   useEffect(() => { weaponConfigRef.current = weaponConfig }, [weaponConfig])
   useEffect(() => { classConfigRef.current = classConfig }, [classConfig])
 
-  const keys = useRef({})
-  const mouseDown = useRef(false)
   const isAttackingRef = useRef(false)
-  const lastTap = useRef({ key: null, time: 0 })
-  const sprintUntilRef = useRef(0)
-  const sprintCooldownRef = useRef(0)
-  const isSprintingRef = useRef(false)
   const lastAutoFireAt = useRef(0)
   const lastBroadcastAt = useRef(0)
   const animationFrameRef = useRef(null)
@@ -585,6 +578,49 @@ export default function TeamBattleArena({ room, players, warrior, session, onBac
   }, [skillConfig, addLog, broadcast])
 
   /* =========================================================
+     输入：桌面端键盘/鼠标 或 手机端虚拟摇杆/按钮，
+     由 useGameControls 按设备类型二选一，接口一致。
+
+     Team Battle 特有：死亡等待重生期间不应该更新瞄准角度
+     （原逻辑：鼠标移动时 if (!meRef.current.alive) return），
+     两个底层 hook 只认识 meRef.current.downed，不认识
+     alive，所以这里用 setMeIfAlive 包一层再传给 hook，
+     死亡状态下瞄准角度会被这层包装直接吞掉，行为跟以前一致。
+  ========================================================= */
+  const setMeIfAlive = useCallback((updater) => {
+    if (!meRef.current.alive) return
+    setMe(updater)
+  }, [])
+
+  const {
+    keys,
+    mouseDown,
+    sprintUntilRef,
+    isSprintingRef,
+    isSprinting,
+    setIsSprinting,
+    isMobile,
+    handleMoveJoystick,
+    handleAimJoystick,
+    handleFireStart,
+    handleFireEnd,
+    handleSprintStart,
+    handleSprintEnd,
+    handleSkillTap,
+  } = useGameControls({
+    meRef,
+    setMe: setMeIfAlive,
+    matchPhaseRef,
+    weaponConfig,
+    performAttack,
+    activateSkill,
+    screenToWorld: (sx, sy) => ({
+      x: (sx - mapOffsetRef.current.x) / MAP_SCALE,
+      y: (sy - mapOffsetRef.current.y) / MAP_SCALE,
+    }),
+  })
+
+  /* =========================================================
      重开一局
   ========================================================= */
   const resetMatch = useCallback(() => {
@@ -611,7 +647,6 @@ export default function TeamBattleArena({ room, players, warrior, session, onBac
 
     isAttackingRef.current = false
     sprintUntilRef.current = 0
-    sprintCooldownRef.current = 0
     isSprintingRef.current = false
     lastAutoFireAt.current = 0
     respawnAtRef.current = 0
@@ -621,7 +656,7 @@ export default function TeamBattleArena({ room, players, warrior, session, onBac
     setMatchPhase('countdown')
     setWinner(null)
     addLog('🔄 新的一局开始！')
-  }, [classConfig.hp, addLog, activeMap, myTeam, mySlot, buildInitialOthers])
+  }, [classConfig.hp, addLog, activeMap, myTeam, mySlot, buildInitialOthers, sprintUntilRef, isSprintingRef])
 
   useEffect(() => { resetMatchRef.current = resetMatch }, [resetMatch])
 
@@ -629,71 +664,6 @@ export default function TeamBattleArena({ room, players, warrior, session, onBac
     resetMatch()
     broadcast('restart', {})
   }, [resetMatch, broadcast])
-
-  /* =========================================================
-     输入：键盘（移动 + 连按冲刺 + Q 技能）
-  ========================================================= */
-  useEffect(() => {
-    const handleKeyDown = (e) => {
-      if (matchPhaseRef.current !== 'fighting') return
-      const k = e.key.toLowerCase()
-      keys.current[k] = true
-
-      if (['w', 'a', 's', 'd'].includes(k)) {
-        const now = Date.now()
-        if (
-          lastTap.current.key === k &&
-          now - lastTap.current.time < 300 &&
-          now > sprintCooldownRef.current
-        ) {
-          sprintUntilRef.current = now + SPRINT_DURATION_MS
-          sprintCooldownRef.current = now + SPRINT_COOLDOWN_MS
-          setIsSprinting(true)
-        }
-        lastTap.current = { key: k, time: now }
-      }
-
-      if (k === 'q') activateSkill()
-    }
-
-    const handleKeyUp = (e) => { keys.current[e.key.toLowerCase()] = false }
-
-    window.addEventListener('keydown', handleKeyDown)
-    window.addEventListener('keyup', handleKeyUp)
-    return () => {
-      window.removeEventListener('keydown', handleKeyDown)
-      window.removeEventListener('keyup', handleKeyUp)
-    }
-  }, [activateSkill])
-
-  /* ---------------- 输入：鼠标 ---------------- */
-  useEffect(() => {
-    const handleMouseMove = (e) => {
-      if (!meRef.current.alive) return
-      const worldX = (e.clientX - mapOffsetRef.current.x) / MAP_SCALE
-      const worldY = (e.clientY - mapOffsetRef.current.y) / MAP_SCALE
-      setMe((prev) => ({ ...prev, angle: Math.atan2(worldY - prev.y, worldX - prev.x) }))
-    }
-    const handleMouseDown = (e) => {
-      if (e.button !== 0) return
-      mouseDown.current = true
-      if (matchPhaseRef.current !== 'fighting') return
-      if (weaponConfig.mode !== 'auto') performAttack()
-    }
-    const handleMouseUp = (e) => { if (e.button === 0) mouseDown.current = false }
-    const handleBlur = () => { mouseDown.current = false }
-
-    window.addEventListener('mousemove', handleMouseMove)
-    window.addEventListener('mousedown', handleMouseDown)
-    window.addEventListener('mouseup', handleMouseUp)
-    window.addEventListener('blur', handleBlur)
-    return () => {
-      window.removeEventListener('mousemove', handleMouseMove)
-      window.removeEventListener('mousedown', handleMouseDown)
-      window.removeEventListener('mouseup', handleMouseUp)
-      window.removeEventListener('blur', handleBlur)
-    }
-  }, [performAttack, weaponConfig.mode])
 
   /* =========================================================
      主循环
@@ -839,7 +809,7 @@ export default function TeamBattleArena({ room, players, warrior, session, onBac
     }
     animationFrameRef.current = requestAnimationFrame(loop)
     return () => cancelAnimationFrame(animationFrameRef.current)
-  }, [matchPhase, spawnProjectile, dealDamageToTarget, broadcast, broadcastOwnState, activeMap, myTeam, mySlot, addLog])
+  }, [matchPhase, spawnProjectile, dealDamageToTarget, broadcast, broadcastOwnState, activeMap, myTeam, mySlot, addLog, keys, mouseDown, sprintUntilRef, isSprintingRef, setIsSprinting])
 
   /* =========================================================
      渲染
@@ -860,7 +830,7 @@ export default function TeamBattleArena({ room, players, warrior, session, onBac
         backgroundColor: '#090909',
         backgroundImage: 'linear-gradient(rgba(255,255,255,0.03) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.03) 1px, transparent 1px)',
         backgroundSize: '50px 50px',
-        overflow: 'hidden', userSelect: 'none', cursor: 'crosshair', zIndex: 9999,
+        overflow: 'hidden', userSelect: 'none', cursor: isMobile ? 'default' : 'crosshair', zIndex: 9999,
       }}
     >
       <div style={{ position: 'absolute', inset: 0, overflow: 'hidden' }}>
@@ -910,7 +880,7 @@ export default function TeamBattleArena({ room, players, warrior, session, onBac
             🛡 出生保护中 {Math.max(0, ((me.protectedUntil - Date.now()) / 1000)).toFixed(1)}s
           </div>
         )}
-        {skillConfig && (
+        {skillConfig && !isMobile && (
           <div style={{ marginTop: 8, fontSize: 12, fontWeight: 'bold', color: skillActiveNow ? skillConfig.color : skillReady ? '#fff' : '#666' }}>
             {skillActiveNow
               ? skillConfig.icon + ' ' + skillConfig.label + ' ACTIVE'
@@ -1042,15 +1012,32 @@ export default function TeamBattleArena({ room, players, warrior, session, onBac
         </div>
       </div>
 
-      {/* 战斗日志 */}
-
-      <div style={{ position: 'absolute', bottom: 20, left: 20, zIndex: 100, background: 'rgba(0,0,0,0.7)', padding: 15, borderRadius: 8, color: '#fff', maxWidth: 320 }}>
-        {logs.map((log, i) => <div key={i} style={{ marginBottom: 4, fontSize: 13 }}>{log}</div>)}
-      </div>
+      {/* 战斗日志（手机上屏幕太挤，隐藏掉，留给虚拟摇杆） */}
+      {!isMobile && (
+        <div style={{ position: 'absolute', bottom: 20, left: 20, zIndex: 100, background: 'rgba(0,0,0,0.7)', padding: 15, borderRadius: 8, color: '#fff', maxWidth: 320 }}>
+          {logs.map((log, i) => <div key={i} style={{ marginBottom: 4, fontSize: 13 }}>{log}</div>)}
+        </div>
+      )}
 
       {/* 赛前倒数 */}
       {matchPhase === 'countdown' && (
         <MatchCountdown title="TEAM BATTLE" onComplete={() => setMatchPhase('fighting')} />
+      )}
+
+      {/* 手机端虚拟摇杆 + 开火/冲刺/技能按钮 */}
+      {isMobile && matchPhase === 'fighting' && (
+        <MobileControlsOverlay
+          onMove={handleMoveJoystick}
+          onAim={handleAimJoystick}
+          onFireStart={handleFireStart}
+          onFireEnd={handleFireEnd}
+          onSprintStart={handleSprintStart}
+          onSprintEnd={handleSprintEnd}
+          isSprinting={isSprinting}
+          onSkillTap={handleSkillTap}
+          skillConfig={skillConfig}
+          skillReady={skillReady}
+        />
       )}
 
       {/* 退出按钮 */}
