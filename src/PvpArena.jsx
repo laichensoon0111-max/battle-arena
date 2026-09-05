@@ -5,6 +5,8 @@ import { BUILTIN_MAPS, resolveWallCollision, isBulletBlocked } from './mapSystem
 import MapRenderer from './MapRenderer'
 import { canSeeEnemy, markShooterRevealed, shapeOutgoingVisibility } from './useMapVisibility'
 import MatchCountdown from './MatchCountdown'
+import useGameControls from './useGameControls'
+import MobileControlsOverlay from './MobileControlsOverlay'
 
 /* =====================================================
    常量
@@ -12,8 +14,6 @@ import MatchCountdown from './MatchCountdown'
 
 const HIT_RADIUS = 20
 const STATE_BROADCAST_MS = 70       // 每隔多久广播一次自己的位置/血量
-const SPRINT_DURATION_MS = 500
-const SPRINT_COOLDOWN_MS = 1000
 const ENEMY_LERP = 0.25             // 对手位置插值平滑系数
 
 /* 点到线段的最短距离，用于 hitscan（狙击枪/激光枪）命中判定 */
@@ -137,7 +137,6 @@ export default function PvpArena({ room, players, warrior, session, onBack, map,
   const [skillCooldownUntil, setSkillCooldownUntil] = useState(0)
   const [enemySkill, setEnemySkill] = useState({ active: false, type: null })
   const [flash, setFlash] = useState(null) // { who: 'me' | 'enemy', color, until }
-  const [isSprinting, setIsSprinting] = useState(false)
 
   // 地图永远居中显示在屏幕正中间，不跟随玩家移动。
   // 只在窗口大小变化时重新计算一次偏移量，不需要每帧更新。
@@ -189,13 +188,7 @@ export default function PvpArena({ room, players, warrior, session, onBack, map,
   useEffect(() => { weaponConfigRef.current = weaponConfig }, [weaponConfig])
   useEffect(() => { classConfigRef.current = classConfig }, [classConfig])
 
-  const keys = useRef({})
-  const mouseDown = useRef(false)
   const isAttackingRef = useRef(false)
-  const lastTap = useRef({ key: null, time: 0 })
-  const sprintUntilRef = useRef(0)
-  const sprintCooldownRef = useRef(0)
-  const isSprintingRef = useRef(false)
   const lastAutoFireAt = useRef(0)
   const lastBroadcastAt = useRef(0)
   const animationFrameRef = useRef(null)
@@ -453,6 +446,39 @@ export default function PvpArena({ room, players, warrior, session, onBack, map,
   }, [skillConfig, addLog, broadcast])
 
   /* =========================================================
+     输入：桌面端键盘/鼠标 或 手机端虚拟摇杆/按钮，
+     由 useGameControls 按设备类型二选一，接口完全一致，
+     下面主循环/重开逻辑不需要关心当前用的是哪一套。
+  ========================================================= */
+  const {
+    keys,
+    mouseDown,
+    sprintUntilRef,
+    isSprintingRef,
+    isSprinting,
+    setIsSprinting,
+    isMobile,
+    handleMoveJoystick,
+    handleAimJoystick,
+    handleFireStart,
+    handleFireEnd,
+    handleSprintStart,
+    handleSprintEnd,
+    handleSkillTap,
+  } = useGameControls({
+    meRef,
+    setMe,
+    matchPhaseRef,
+    weaponConfig,
+    performAttack,
+    activateSkill,
+    screenToWorld: (sx, sy) => ({
+      x: (sx - mapOffsetRef.current.x) / MAP_SCALE,
+      y: (sy - mapOffsetRef.current.y) / MAP_SCALE,
+    }),
+  })
+
+  /* =========================================================
      重开一局
   ========================================================= */
   const resetMatch = useCallback(() => {
@@ -473,7 +499,6 @@ export default function PvpArena({ room, players, warrior, session, onBack, map,
 
     isAttackingRef.current = false
     sprintUntilRef.current = 0
-    sprintCooldownRef.current = 0
     isSprintingRef.current = false
     lastAutoFireAt.current = 0
 
@@ -483,7 +508,7 @@ export default function PvpArena({ room, players, warrior, session, onBack, map,
     matchPhaseRef.current = 'countdown'
     setMatchPhase('countdown')
     addLog('🔄 新的一局开始！')
-  }, [classConfig.hp, enemyClassConfig.hp, addLog, startX, startY, enemyStartX, enemyStartY])
+  }, [classConfig.hp, enemyClassConfig.hp, addLog, startX, startY, enemyStartX, enemyStartY, sprintUntilRef, isSprintingRef])
 
   useEffect(() => { resetMatchRef.current = resetMatch }, [resetMatch])
 
@@ -491,73 +516,6 @@ export default function PvpArena({ room, players, warrior, session, onBack, map,
     resetMatch()
     broadcast('restart', {})
   }, [resetMatch, broadcast])
-
-  /* =========================================================
-     输入：键盘（移动 + 连按冲刺 + Q 技能）
-  ========================================================= */
-  useEffect(() => {
-    const handleKeyDown = (e) => {
-      if (matchPhaseRef.current !== 'fighting') return
-      const k = e.key.toLowerCase()
-      keys.current[k] = true
-
-      if (['w', 'a', 's', 'd'].includes(k)) {
-        const now = Date.now()
-        if (
-          lastTap.current.key === k &&
-          now - lastTap.current.time < 300 &&
-          now > sprintCooldownRef.current
-        ) {
-          sprintUntilRef.current = now + SPRINT_DURATION_MS
-          sprintCooldownRef.current = now + SPRINT_COOLDOWN_MS
-          setIsSprinting(true)
-        }
-        lastTap.current = { key: k, time: now }
-      }
-
-      if (k === 'q') activateSkill()
-    }
-
-    const handleKeyUp = (e) => { keys.current[e.key.toLowerCase()] = false }
-
-    window.addEventListener('keydown', handleKeyDown)
-    window.addEventListener('keyup', handleKeyUp)
-    return () => {
-      window.removeEventListener('keydown', handleKeyDown)
-      window.removeEventListener('keyup', handleKeyUp)
-    }
-  }, [activateSkill])
-
-  /* ---------------- 输入：鼠标（瞄准 + 开火） ---------------- */
-  useEffect(() => {
-    const handleMouseMove = (e) => {
-    // 屏幕坐标 → 世界坐标：减去居中偏移、再除以缩放比例
-      const worldX = (e.clientX - mapOffsetRef.current.x) / MAP_SCALE
-      const worldY = (e.clientY - mapOffsetRef.current.y) / MAP_SCALE
-      setMe((prev) => ({ ...prev, angle: Math.atan2(worldY - prev.y, worldX - prev.x) }))
-    }
-    const handleMouseDown = (e) => {
-      if (e.button !== 0) return
-      mouseDown.current = true
-      if (matchPhaseRef.current !== 'fighting') return
-      if (weaponConfig.mode !== 'auto') performAttack()
-    }
-    const handleMouseUp = (e) => { if (e.button === 0) mouseDown.current = false }
-    // 切出窗口/切到别的 App 时浏览器可能收不到 mouseup，
-    // 不清掉的话 SMG/LMG 会以为左键一直按着（或者反过来一直判定"没在按"）。
-    const handleBlur = () => { mouseDown.current = false }
-
-    window.addEventListener('mousemove', handleMouseMove)
-    window.addEventListener('mousedown', handleMouseDown)
-    window.addEventListener('mouseup', handleMouseUp)
-    window.addEventListener('blur', handleBlur)
-    return () => {
-      window.removeEventListener('mousemove', handleMouseMove)
-      window.removeEventListener('mousedown', handleMouseDown)
-      window.removeEventListener('mouseup', handleMouseUp)
-      window.removeEventListener('blur', handleBlur)
-    }
-  }, [performAttack, weaponConfig.mode])
 
   /* =========================================================
      主循环：移动 / 对手插值 / 子弹移动+命中判定 / 连发 / 摄像机 / 状态广播
@@ -682,7 +640,7 @@ export default function PvpArena({ room, players, warrior, session, onBack, map,
 
     animationFrameRef.current = requestAnimationFrame(loop)
     return () => cancelAnimationFrame(animationFrameRef.current)
-  }, [gameOver, matchPhase, spawnProjectile, dealDamageToEnemy, broadcast, activeMap])
+  }, [gameOver, matchPhase, spawnProjectile, dealDamageToEnemy, broadcast, activeMap, keys, mouseDown, sprintUntilRef, isSprintingRef, setIsSprinting])
 
   /* =========================================================
      渲染
@@ -699,7 +657,7 @@ export default function PvpArena({ room, players, warrior, session, onBack, map,
         backgroundColor: '#090909',
         backgroundImage: 'linear-gradient(rgba(255,255,255,0.03) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.03) 1px, transparent 1px)',
         backgroundSize: '50px 50px',
-        overflow: 'hidden', userSelect: 'none', cursor: 'crosshair', zIndex: 9999,
+        overflow: 'hidden', userSelect: 'none', cursor: isMobile ? 'default' : 'crosshair', zIndex: 9999,
       }}
     >
        {/* 游戏世界：地图 + 角色 + 子弹等，固定居中显示，不跟随玩家移动 */}
@@ -810,7 +768,7 @@ export default function PvpArena({ room, players, warrior, session, onBack, map,
             🌿 隐蔽中 — 敌人看不到你（开枪会暴露）
           </div>
         )}
-        {skillConfig && (
+        {skillConfig && !isMobile && (
           <div style={{ marginTop: 8, fontSize: 12, fontWeight: 'bold', color: skillActiveNow ? skillConfig.color : skillReady ? '#fff' : '#666' }}>
             {skillActiveNow
               ? skillConfig.icon + ' ' + skillConfig.label + ' ACTIVE'
@@ -837,20 +795,42 @@ export default function PvpArena({ room, players, warrior, session, onBack, map,
         )}
       </div>
 
-      {/* 战斗日志 */}
-      <div style={{ position: 'absolute', bottom: 20, left: 20, zIndex: 100, background: 'rgba(0,0,0,0.7)', padding: 15, borderRadius: 8, color: '#fff', maxWidth: 320 }}>
-        {logs.map((log, i) => <div key={i} style={{ marginBottom: 4, fontSize: 13 }}>{log}</div>)}
-      </div>
+      {/* 战斗日志（手机上屏幕太挤，隐藏掉，留给虚拟摇杆） */}
+      {!isMobile && (
+        <div style={{ position: 'absolute', bottom: 20, left: 20, zIndex: 100, background: 'rgba(0,0,0,0.7)', padding: 15, borderRadius: 8, color: '#fff', maxWidth: 320 }}>
+          {logs.map((log, i) => <div key={i} style={{ marginBottom: 4, fontSize: 13 }}>{log}</div>)}
+        </div>
+      )}
 
       {/* 赛前倒数：READY? → 3 → 2 → 1 → FIGHT! */}
       {matchPhase === 'countdown' && (
         <MatchCountdown title="1V1 DUEL" onComplete={() => setMatchPhase('fighting')} />
       )}
 
+      {/* 手机端虚拟摇杆 + 开火/冲刺/技能按钮 */}
+      {isMobile && matchPhase === 'fighting' && !gameOver && (
+        <MobileControlsOverlay
+          onMove={handleMoveJoystick}
+          onAim={handleAimJoystick}
+          onFireStart={handleFireStart}
+          onFireEnd={handleFireEnd}
+          onSprintStart={handleSprintStart}
+          onSprintEnd={handleSprintEnd}
+          isSprinting={isSprinting}
+          onSkillTap={handleSkillTap}
+          skillConfig={skillConfig}
+          skillReady={skillReady}
+        />
+      )}
+
       {/* 退出按钮 */}
       <button
         onClick={onBack}
-        style={{ position: 'absolute', bottom: 20, right: 20, zIndex: 100, padding: '10px 20px', background: '#444', border: 'none', borderRadius: 4, color: '#fff', cursor: 'pointer', fontWeight: 'bold' }}
+        style={{
+          position: 'absolute', top: isMobile ? 'auto' : undefined, bottom: 20, right: 20, zIndex: 100,
+          padding: '10px 20px', background: '#444', border: 'none', borderRadius: 4, color: '#fff',
+          cursor: 'pointer', fontWeight: 'bold',
+        }}
       >
         LEAVE MATCH
       </button>
