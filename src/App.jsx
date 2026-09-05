@@ -11,6 +11,9 @@ import { battleModes } from './GameModes'
 import MapEditor from './MapEditor'
 import { BUILTIN_MAPS } from './mapSystem'
 import ErrorBoundary from './ErrorBoundary'
+import useIsMobile from './useIsMobile'
+import MapScaleControl from './MapScaleControl'
+import { getStoredMapScale, setStoredMapScale } from './mapScaleStore'
 
 /* =====================================================
    DEFAULT WARRIOR
@@ -1082,11 +1085,18 @@ function Lobby({ warrior, session, onBack, onLogout, onOpenMapEditor, onRoomCrea
 ===================================================== */
 
 function RoomPage({ room, warrior, setWarrior, onSaveWarrior, savingWarrior, session, onBack }) {
+  const isMobile = useIsMobile()
+  const [mapScale, setMapScale] = useState(() => getStoredMapScale(isMobile))
   const [currentRoom, setCurrentRoom] = useState(room)
   const [players, setPlayers] = useState([])
   const [loading, setLoading] = useState(true)
   const [showCustomize, setShowCustomize] = useState(false)
   const [customizeMessage, setCustomizeMessage] = useState('')
+
+  function handleMapScaleChange(value) {
+    setMapScale(value)
+    setStoredMapScale(value)
+  }
 
   async function loadPlayers() {
     if (!room?.id) return
@@ -1538,6 +1548,11 @@ function RoomPage({ room, warrior, setWarrior, onSaveWarrior, savingWarrior, ses
               <p style={{ color: '#666', fontSize: 12 }}>
                 Change your name or gear without leaving the room.
               </p>
+
+              <MapScaleControl value={mapScale} onChange={handleMapScaleChange} />
+              <p style={{ color: '#666', fontSize: 12 }}>
+                Adjust how big the map looks on your screen. This is saved per device, so it won't affect other players.
+              </p>
             </div>
           </div>
 
@@ -1707,6 +1722,7 @@ function RoomPage({ room, warrior, setWarrior, onSaveWarrior, savingWarrior, ses
           warrior={warrior}
           session={session}
           map={currentRoom?.map_data || BUILTIN_MAPS[0]}
+          mapScale={mapScale}
           onBack={leaveRoom}
           onMatchEnd={returnToLobby}
         />
@@ -1724,6 +1740,7 @@ function RoomPage({ room, warrior, setWarrior, onSaveWarrior, savingWarrior, ses
           warrior={warrior}
           session={session}
           map={currentRoom?.map_data || BUILTIN_MAPS[0]}
+          mapScale={mapScale}
           onBack={leaveRoom}
           onMatchEnd={returnToLobby}
         />
@@ -1741,6 +1758,7 @@ function RoomPage({ room, warrior, setWarrior, onSaveWarrior, savingWarrior, ses
           warrior={warrior}
           session={session}
           map={currentRoom?.map_data || BUILTIN_MAPS[0]}
+          mapScale={mapScale}
           onBack={leaveRoom}
           onMatchEnd={returnToLobby}
         />
@@ -1758,6 +1776,7 @@ function RoomPage({ room, warrior, setWarrior, onSaveWarrior, savingWarrior, ses
           warrior={warrior}
           session={session}
           map={currentRoom?.map_data || BUILTIN_MAPS[0]}
+          mapScale={mapScale}
           onBack={leaveRoom}
           onMatchEnd={returnToLobby}
         />        <RoomChat room={currentRoom} session={session} />
@@ -1774,6 +1793,7 @@ function RoomPage({ room, warrior, setWarrior, onSaveWarrior, savingWarrior, ses
         warrior={warrior}
         session={session}
         map={currentRoom?.map_data || BUILTIN_MAPS[0]}
+        mapScale={mapScale}
         onBack={leaveRoom}
         onMatchEnd={returnToLobby}
       />

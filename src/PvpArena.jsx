@@ -86,7 +86,7 @@ function FighterAvatar({ x, y, angle, color, emoji, isFlashing, flashColor }) {
    - 多个 enemy/队友 → 把 enemy 单一对象换成数组
    - 广播 channel 复用同一套 state / shoot / hit / skill / death 事件
 ===================================================== */
-export default function PvpArena({ room, players, warrior, session, onBack, map, onMatchEnd }) {
+export default function PvpArena({ room, players, warrior, session, onBack, map, onMatchEnd, mapScale }) {
   const opponentRow = players.find((p) => p.user_id !== session.user.id)
   const myWarrior = warrior
   const enemyWarrior = opponentRow?.warrior || {
@@ -140,7 +140,7 @@ export default function PvpArena({ room, players, warrior, session, onBack, map,
 
   // 地图永远居中显示在屏幕正中间，不跟随玩家移动。
   // 只在窗口大小变化时重新计算一次偏移量，不需要每帧更新。
-  const MAP_SCALE = 0.7 // 保持原来的整体缩放比例
+  const MAP_SCALE = mapScale ?? 0.7 // 使用房间设置的地图缩放比例  
   const [mapOffset, setMapOffset] = useState({ x: 0, y: 0 })
   const mapOffsetRef = useRef({ x: 0, y: 0 })
 
