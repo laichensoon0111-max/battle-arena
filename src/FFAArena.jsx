@@ -5,6 +5,8 @@ import { BUILTIN_MAPS, resolveWallCollision, isBulletBlocked, isMovementBlockedA
 import MapRenderer from './MapRenderer'
 import { canSeeEnemy, markShooterRevealed, shapeOutgoingVisibility } from './useMapVisibility'
 import MatchCountdown from './MatchCountdown'
+import useGameControls from './useGameControls'
+import MobileControlsOverlay from './MobileControlsOverlay'
 
 /* =====================================================
    FREE FOR ALL（最多 8 人，无队伍，人人都是敌人）
@@ -12,8 +14,6 @@ import MatchCountdown from './MatchCountdown'
 
 const HIT_RADIUS = 20
 const STATE_BROADCAST_MS = 70
-const SPRINT_DURATION_MS = 500
-const SPRINT_COOLDOWN_MS = 1000
 const OTHER_LERP = 0.25
 const RESPAWN_MS = 3000
 const MATCH_DURATION_MS = 5 * 60 * 1000
@@ -118,7 +118,7 @@ function FFAFighterAvatar({ x, y, angle, color, emoji, isSelf, isFlashing, flash
 /* =====================================================
    FFA 核心组件
 ===================================================== */
-export default function FFAArena({ room, players, warrior, session, onBack, map, onMatchEnd }) {
+export default function FFAArena({ room, players, warrior, session, onBack, map, onMatchEnd, mapScale }) {
   const myId = session.user.id
   const isHost = room?.host_id === myId
   const activeMap = map || room?.map_data || BUILTIN_MAPS[0]
@@ -127,7 +127,7 @@ export default function FFAArena({ room, players, warrior, session, onBack, map,
   const orderedPlayers = players
 
   // 地图永远居中显示在屏幕正中间，不跟随玩家移动。
-  const MAP_SCALE = 0.7
+  const MAP_SCALE = mapScale ?? 0.7
   const [mapOffset, setMapOffset] = useState({ x: 0, y: 0 })
   const mapOffsetRef = useRef({ x: 0, y: 0 })
 
@@ -143,7 +143,7 @@ export default function FFAArena({ room, players, warrior, session, onBack, map,
     computeOffset()
     window.addEventListener('resize', computeOffset)
     return () => window.removeEventListener('resize', computeOffset)
-  }, [mapPxW, mapPxH])
+  }, [mapPxW, mapPxH, MAP_SCALE])
 
   const myWarrior = warrior
   const classConfig = Classes[myWarrior.outfit] || Classes.warrior
@@ -190,7 +190,6 @@ export default function FFAArena({ room, players, warrior, session, onBack, map,
   const [skillState, setSkillState] = useState({ active: false, until: 0, type: null })
   const [skillCooldownUntil, setSkillCooldownUntil] = useState(0)
   const [flash, setFlash] = useState(null)
-  const [isSprinting, setIsSprinting] = useState(false)
 
   const [matchPhase, setMatchPhase] = useState('countdown')
   const matchPhaseRef = useRef('countdown')
@@ -217,13 +216,7 @@ export default function FFAArena({ room, players, warrior, session, onBack, map,
   useEffect(() => { weaponConfigRef.current = weaponConfig }, [weaponConfig])
   useEffect(() => { classConfigRef.current = classConfig }, [classConfig])
 
-  const keys = useRef({})
-  const mouseDown = useRef(false)
   const isAttackingRef = useRef(false)
-  const lastTap = useRef({ key: null, time: 0 })
-  const sprintUntilRef = useRef(0)
-  const sprintCooldownRef = useRef(0)
-  const isSprintingRef = useRef(false)
   const lastAutoFireAt = useRef(0)
   const lastBroadcastAt = useRef(0)
   const animationFrameRef = useRef(null)
@@ -510,6 +503,45 @@ export default function FFAArena({ room, players, warrior, session, onBack, map,
     setTimeout(() => broadcast('skill', { active: false }), skillConfig.durationMs)
   }, [skillConfig, addLog, broadcast])
 
+  /* =========================================================
+     输入：桌面端键盘/鼠标 或 手机端虚拟摇杆/按钮，由 useGameControls
+     按设备类型二选一。FFA 特有：死亡等待重生期间不更新瞄准角度
+     （原逻辑：鼠标移动时 if (!meRef.current.alive) return），
+     用 setMeIfAlive 包一层再传给 hook，保持行为不变。
+  ========================================================= */
+  const setMeIfAlive = useCallback((updater) => {
+    if (!meRef.current.alive) return
+    setMe(updater)
+  }, [])
+
+  const {
+    keys,
+    mouseDown,
+    sprintUntilRef,
+    isSprintingRef,
+    isSprinting,
+    setIsSprinting,
+    isMobile,
+    handleMoveJoystick,
+    handleAimJoystick,
+    handleFireStart,
+    handleFireEnd,
+    handleSprintStart,
+    handleSprintEnd,
+    handleSkillTap,
+  } = useGameControls({
+    meRef,
+    setMe: setMeIfAlive,
+    matchPhaseRef,
+    weaponConfig,
+    performAttack,
+    activateSkill,
+    screenToWorld: (sx, sy) => ({
+      x: (sx - mapOffsetRef.current.x) / MAP_SCALE,
+      y: (sy - mapOffsetRef.current.y) / MAP_SCALE,
+    }),
+  })
+
   const resetMatch = useCallback(() => {
     const pos = spawnPixel(activeMap, pickSpawnTile(activeMap))
     setMe({
@@ -530,7 +562,6 @@ export default function FFAArena({ room, players, warrior, session, onBack, map,
 
     isAttackingRef.current = false
     sprintUntilRef.current = 0
-    sprintCooldownRef.current = 0
     isSprintingRef.current = false
     lastAutoFireAt.current = 0
     respawnAtRef.current = 0
@@ -540,7 +571,7 @@ export default function FFAArena({ room, players, warrior, session, onBack, map,
     setMatchPhase('countdown')
     setTimeLeftMs(MATCH_DURATION_MS)
     addLog('🔄 新的一局开始！')
-  }, [classConfig.hp, addLog, activeMap, buildInitialOthers])
+  }, [classConfig.hp, addLog, activeMap, buildInitialOthers, sprintUntilRef, isSprintingRef])
 
   useEffect(() => { resetMatchRef.current = resetMatch }, [resetMatch])
 
@@ -548,67 +579,6 @@ export default function FFAArena({ room, players, warrior, session, onBack, map,
     resetMatch()
     broadcast('restart', {})
   }, [resetMatch, broadcast])
-
-  useEffect(() => {
-    const handleKeyDown = (e) => {
-      if (matchPhaseRef.current !== 'fighting') return
-      const k = e.key.toLowerCase()
-      keys.current[k] = true
-
-      if (['w', 'a', 's', 'd'].includes(k)) {
-        const now = Date.now()
-        if (
-          lastTap.current.key === k &&
-          now - lastTap.current.time < 300 &&
-          now > sprintCooldownRef.current
-        ) {
-          sprintUntilRef.current = now + SPRINT_DURATION_MS
-          sprintCooldownRef.current = now + SPRINT_COOLDOWN_MS
-          setIsSprinting(true)
-        }
-        lastTap.current = { key: k, time: now }
-      }
-
-      if (k === 'q') activateSkill()
-    }
-
-    const handleKeyUp = (e) => { keys.current[e.key.toLowerCase()] = false }
-
-    window.addEventListener('keydown', handleKeyDown)
-    window.addEventListener('keyup', handleKeyUp)
-    return () => {
-      window.removeEventListener('keydown', handleKeyDown)
-      window.removeEventListener('keyup', handleKeyUp)
-    }
-  }, [activateSkill])
-
-  useEffect(() => {
-    const handleMouseMove = (e) => {
-      if (!meRef.current.alive) return
-      const worldX = (e.clientX - mapOffsetRef.current.x) / MAP_SCALE
-      const worldY = (e.clientY - mapOffsetRef.current.y) / MAP_SCALE
-      setMe((prev) => ({ ...prev, angle: Math.atan2(worldY - prev.y, worldX - prev.x) }))
-    }
-    const handleMouseDown = (e) => {
-      if (e.button !== 0) return
-      mouseDown.current = true
-      if (matchPhaseRef.current !== 'fighting') return
-      if (weaponConfig.mode !== 'auto') performAttack()
-    }
-    const handleMouseUp = (e) => { if (e.button === 0) mouseDown.current = false }
-    const handleBlur = () => { mouseDown.current = false }
-
-    window.addEventListener('mousemove', handleMouseMove)
-    window.addEventListener('mousedown', handleMouseDown)
-    window.addEventListener('mouseup', handleMouseUp)
-    window.addEventListener('blur', handleBlur)
-    return () => {
-      window.removeEventListener('mousemove', handleMouseMove)
-      window.removeEventListener('mousedown', handleMouseDown)
-      window.removeEventListener('mouseup', handleMouseUp)
-      window.removeEventListener('blur', handleBlur)
-    }
-  }, [performAttack, weaponConfig.mode])
 
   useEffect(() => {
     if (matchPhase !== 'fighting') return
@@ -748,7 +718,7 @@ export default function FFAArena({ room, players, warrior, session, onBack, map,
 
     animationFrameRef.current = requestAnimationFrame(loop)
     return () => cancelAnimationFrame(animationFrameRef.current)
-  }, [matchPhase, spawnProjectile, dealDamageToTarget, broadcast, broadcastOwnState, activeMap])
+  }, [matchPhase, spawnProjectile, dealDamageToTarget, broadcast, broadcastOwnState, activeMap, keys, mouseDown, sprintUntilRef, isSprintingRef, setIsSprinting])
 
   const myFlashActive = flash?.who === 'me' && Date.now() < flash.until
   const skillReady = skillConfig && Date.now() >= skillCooldownUntil
@@ -768,7 +738,7 @@ export default function FFAArena({ room, players, warrior, session, onBack, map,
       style={{
         position: 'fixed', top: 0, left: 0, width: '100vw', height: '100vh',
         backgroundColor: '#090909',
-        overflow: 'hidden', userSelect: 'none', cursor: 'crosshair', zIndex: 9999,
+        overflow: 'hidden', userSelect: 'none', cursor: isMobile ? 'default' : 'crosshair', zIndex: 9999,
       }}
     >
       {/* 摄像机 viewport：地图 + 所有世界坐标物体在同一层，固定居中显示 */}
@@ -915,7 +885,7 @@ export default function FFAArena({ room, players, warrior, session, onBack, map,
             🌿 隐蔽中 — 敌人看不到你（开枪会暴露）
           </div>
         )}
-        {skillConfig && (
+        {skillConfig && !isMobile && (
           <div style={{ marginTop: 8, fontSize: 12, fontWeight: 'bold', color: skillActiveNow ? skillConfig.color : skillReady ? '#fff' : '#666' }}>
             {skillActiveNow
               ? skillConfig.icon + ' ' + skillConfig.label + ' ACTIVE'
@@ -955,10 +925,12 @@ export default function FFAArena({ room, players, warrior, session, onBack, map,
         ))}
       </div>
 
-      {/* 战斗日志 */}
-      <div style={{ position: 'absolute', bottom: 20, left: 20, zIndex: 100, background: 'rgba(0,0,0,0.7)', padding: 15, borderRadius: 8, color: '#fff', maxWidth: 320 }}>
-        {logs.map((log, i) => <div key={i} style={{ marginBottom: 4, fontSize: 13 }}>{log}</div>)}
-      </div>
+      {/* 战斗日志（手机上屏幕太挤，隐藏掉，留给虚拟摇杆） */}
+      {!isMobile && (
+        <div style={{ position: 'absolute', bottom: 20, left: 20, zIndex: 100, background: 'rgba(0,0,0,0.7)', padding: 15, borderRadius: 8, color: '#fff', maxWidth: 320 }}>
+          {logs.map((log, i) => <div key={i} style={{ marginBottom: 4, fontSize: 13 }}>{log}</div>)}
+        </div>
+      )}
 
       {/* 赛前倒数 */}
       {matchPhase === 'countdown' && (
@@ -968,6 +940,22 @@ export default function FFAArena({ room, players, warrior, session, onBack, map,
             matchEndAtRef.current = Date.now() + MATCH_DURATION_MS
             setMatchPhase('fighting')
           }}
+        />
+      )}
+
+      {/* 手机端虚拟摇杆 + 开火/冲刺/技能按钮 */}
+      {isMobile && matchPhase === 'fighting' && (
+        <MobileControlsOverlay
+          onMove={handleMoveJoystick}
+          onAim={handleAimJoystick}
+          onFireStart={handleFireStart}
+          onFireEnd={handleFireEnd}
+          onSprintStart={handleSprintStart}
+          onSprintEnd={handleSprintEnd}
+          isSprinting={isSprinting}
+          onSkillTap={handleSkillTap}
+          skillConfig={skillConfig}
+          skillReady={skillReady}
         />
       )}
 

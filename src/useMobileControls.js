@@ -6,6 +6,7 @@ export default function useMobileControls({
   weaponConfig,
   performAttack,
   activateSkill,
+  reviveHoldRef, // 可选：只有 Boss Raid / Survival 这类有救援机制的模式需要传
   enabled = true,
 }) {
   const keys = useRef({})
@@ -14,7 +15,6 @@ export default function useMobileControls({
   const isSprintingRef = useRef(false)
   const [isSprinting, setIsSprinting] = useState(false)
 
-  // 左摇杆：方向转成 WASD 布尔值，主循环完全不用改
   const handleMoveJoystick = useCallback((dx, dy) => {
     if (!enabled || matchPhaseRef.current !== 'fighting') {
       keys.current.w = keys.current.a = keys.current.s = keys.current.d = false
@@ -27,13 +27,11 @@ export default function useMobileControls({
     keys.current.d = dx > DEAD_ZONE
   }, [enabled, matchPhaseRef])
 
-  // 右摇杆：推动方向直接就是瞄准角度
   const handleAimJoystick = useCallback((dx, dy, magnitude) => {
     if (!enabled || magnitude < 0.15) return
     setMe((prev) => ({ ...prev, angle: Math.atan2(dy, dx) }))
   }, [enabled, setMe])
 
-  // 开火按钮：auto 武器按住持续开火，其它武器点一下打一次
   const handleFireStart = useCallback(() => {
     if (!enabled || matchPhaseRef.current !== 'fighting') return
     if (weaponConfig.mode === 'auto') mouseDown.current = true
@@ -42,10 +40,9 @@ export default function useMobileControls({
 
   const handleFireEnd = useCallback(() => { mouseDown.current = false }, [])
 
-  // 冲刺按钮：手机上用"按住=冲刺"代替电脑上的双击 WASD
   const handleSprintStart = useCallback(() => {
     if (!enabled || matchPhaseRef.current !== 'fighting') return
-    sprintUntilRef.current = Date.now() + 999999 // 松手前一直有效
+    sprintUntilRef.current = Date.now() + 999999
     isSprintingRef.current = true
     setIsSprinting(true)
   }, [enabled, matchPhaseRef])
@@ -61,9 +58,22 @@ export default function useMobileControls({
     activateSkill()
   }, [enabled, activateSkill, matchPhaseRef])
 
+  // 救援：按住 = keys.current.f = true，主循环里原有的
+  // "keys.current['f']" 判断完全复用，不用改主循环一行代码。
+  const handleReviveStart = useCallback(() => {
+    if (!enabled || matchPhaseRef.current !== 'fighting') return
+    keys.current.f = true
+  }, [enabled, matchPhaseRef])
+
+  const handleReviveEnd = useCallback(() => {
+    keys.current.f = false
+    if (reviveHoldRef) reviveHoldRef.current = { targetId: null, startedAt: 0 }
+  }, [reviveHoldRef])
+
   return {
     keys, mouseDown, sprintUntilRef, isSprintingRef, isSprinting, setIsSprinting,
     handleMoveJoystick, handleAimJoystick, handleFireStart, handleFireEnd,
     handleSprintStart, handleSprintEnd, handleSkillTap,
+    handleReviveStart, handleReviveEnd,
   }
 }

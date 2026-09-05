@@ -5,6 +5,7 @@ export default function MobileControlsOverlay({
   onFireStart, onFireEnd,
   onSprintStart, onSprintEnd, isSprinting,
   onSkillTap, skillConfig, skillReady,
+  onReviveStart, onReviveEnd, // 可选：传了才渲染救援按钮
 }) {
   return (
     <div style={{ position: 'fixed', inset: 0, zIndex: 150, pointerEvents: 'none' }}>
@@ -52,6 +53,22 @@ export default function MobileControlsOverlay({
           }}
         >
           {skillConfig.icon}
+        </button>
+      )}
+
+      {onReviveStart && (
+        <button
+          onTouchStart={(e) => { e.preventDefault(); onReviveStart() }}
+          onTouchEnd={(e) => { e.preventDefault(); onReviveEnd() }}
+          onTouchCancel={(e) => { e.preventDefault(); onReviveEnd() }}
+          style={{
+            position: 'absolute', left: '50%', bottom: 24, transform: 'translateX(-50%)',
+            width: 70, height: 70, borderRadius: '50%',
+            background: 'rgba(46,204,113,0.85)', border: '3px solid rgba(255,255,255,0.4)',
+            color: '#fff', fontWeight: 800, fontSize: 11, pointerEvents: 'auto', touchAction: 'none',
+          }}
+        >
+          HOLD{'\n'}REVIVE
         </button>
       )}
     </div>

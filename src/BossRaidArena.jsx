@@ -5,13 +5,13 @@ import { BUILTIN_MAPS, resolveWallCollision, isBulletBlocked } from './mapSystem
 import MapRenderer from './MapRenderer'
 import { canSeeEnemy, markShooterRevealed, shapeOutgoingVisibility } from './useMapVisibility'
 import MatchCountdown from './MatchCountdown'
+import useGameControls from './useGameControls'
+import MobileControlsOverlay from './MobileControlsOverlay'
 
 const HIT_RADIUS = 20
 const BOSS_HIT_RADIUS = 55
 const STATE_BROADCAST_MS = 70
 const BOSS_BROADCAST_MS = 100
-const SPRINT_DURATION_MS = 500
-const SPRINT_COOLDOWN_MS = 1000
 const OTHER_LERP = 0.25
 const BOSS_LERP = 0.18
 
@@ -171,7 +171,7 @@ function BossAvatar({ x, y, phase }) {
   )
 }
 
-export default function BossRaidArena({ room, players, warrior, session, onBack, map, onMatchEnd }) {
+export default function BossRaidArena({ room, players, warrior, session, onBack, map, onMatchEnd, mapScale }) {
   const myId = session.user.id
   const activeMap = map || room?.map_data || BUILTIN_MAPS[0]
   const mapPxW = activeMap.width * activeMap.tileSize
@@ -180,7 +180,7 @@ export default function BossRaidArena({ room, players, warrior, session, onBack,
   const isHost = room?.host_id === myId
   const myIndex = Math.max(0, orderedPlayers.findIndex((p) => p.user_id === myId))
 
-  const MAP_SCALE = 0.7
+  const MAP_SCALE = mapScale ?? 0.7
   const [mapOffset, setMapOffset] = useState({ x: 0, y: 0 })
   const mapOffsetRef = useRef({ x: 0, y: 0 })
 
@@ -196,7 +196,7 @@ export default function BossRaidArena({ room, players, warrior, session, onBack,
     computeOffset()
     window.addEventListener('resize', computeOffset)
     return () => window.removeEventListener('resize', computeOffset)
-  }, [mapPxW, mapPxH])
+  }, [mapPxW, mapPxH, MAP_SCALE])
 
   const myWarrior = warrior
   const classConfig = Classes[myWarrior.outfit] || Classes.warrior
@@ -248,7 +248,6 @@ export default function BossRaidArena({ room, players, warrior, session, onBack,
   const [skillState, setSkillState] = useState({ active: false, until: 0, type: null })
   const [skillCooldownUntil, setSkillCooldownUntil] = useState(0)
   const [flash, setFlash] = useState(null)
-  const [isSprinting, setIsSprinting] = useState(false)
 
   const [reviveProgress, setReviveProgress] = useState(null)
   const [damageDealt, setDamageDealt] = useState(0)
@@ -276,13 +275,7 @@ export default function BossRaidArena({ room, players, warrior, session, onBack,
   useEffect(() => { weaponConfigRef.current = weaponConfig }, [weaponConfig])
   useEffect(() => { classConfigRef.current = classConfig }, [classConfig])
 
-  const keys = useRef({})
-  const mouseDown = useRef(false)
   const isAttackingRef = useRef(false)
-  const lastTap = useRef({ key: null, time: 0 })
-  const sprintUntilRef = useRef(0)
-  const sprintCooldownRef = useRef(0)
-  const isSprintingRef = useRef(false)
   const lastAutoFireAt = useRef(0)
   const lastBroadcastAt = useRef(0)
   const lastBossBroadcastAt = useRef(0)
@@ -612,6 +605,51 @@ export default function BossRaidArena({ room, players, warrior, session, onBack,
     setTimeout(() => broadcast('skill', { active: false }), skillConfig.durationMs)
   }, [skillConfig, addLog, broadcast])
 
+  /* =========================================================
+     输入：桌面端键盘/鼠标 或 手机端虚拟摇杆/按钮，由 useGameControls
+     按设备类型二选一。Boss Raid 特有：
+     1. 死亡（downed/eliminated）时不更新瞄准角度 → setMeIfActive 包装
+     2. 长按 F 救援队友 → reviveHoldRef 传给两边的 hook，
+        手机端多出 handleReviveStart/handleReviveEnd，
+        原理是按住时把 keys.current.f 设为 true，
+        下面主循环里原有的 "keys.current['f']" 判断完全不用改。
+  ========================================================= */
+  const setMeIfActive = useCallback((updater) => {
+    if (meRef.current.downed || meRef.current.eliminated) return
+    setMe(updater)
+  }, [])
+
+  const {
+    keys,
+    mouseDown,
+    sprintUntilRef,
+    isSprintingRef,
+    isSprinting,
+    setIsSprinting,
+    isMobile,
+    handleMoveJoystick,
+    handleAimJoystick,
+    handleFireStart,
+    handleFireEnd,
+    handleSprintStart,
+    handleSprintEnd,
+    handleSkillTap,
+    handleReviveStart,
+    handleReviveEnd,
+  } = useGameControls({
+    meRef,
+    setMe: setMeIfActive,
+    matchPhaseRef,
+    weaponConfig,
+    performAttack,
+    activateSkill,
+    reviveHoldRef,
+    screenToWorld: (sx, sy) => ({
+      x: (sx - mapOffsetRef.current.x) / MAP_SCALE,
+      y: (sy - mapOffsetRef.current.y) / MAP_SCALE,
+    }),
+  })
+
   const resetMatch = useCallback(() => {
     const pos = spawnFor(activeMap, myIndex)
     setMe({ x: pos.x, y: pos.y, angle: 0, hp: classConfig.hp, maxHp: classConfig.hp, downed: false, eliminated: false, downedAt: 0 })
@@ -637,7 +675,6 @@ export default function BossRaidArena({ room, players, warrior, session, onBack,
 
     isAttackingRef.current = false
     sprintUntilRef.current = 0
-    sprintCooldownRef.current = 0
     isSprintingRef.current = false
     lastAutoFireAt.current = 0
     reviveHoldRef.current = { targetId: null, startedAt: 0 }
@@ -647,7 +684,7 @@ export default function BossRaidArena({ room, players, warrior, session, onBack,
     setMatchPhase('countdown')
     setMatchResult(null)
     addLog('🔄 新的一局开始！')
-  }, [classConfig.hp, addLog, activeMap, myIndex, buildInitialOthers, bossStartPos.x, bossStartPos.y])
+  }, [classConfig.hp, addLog, activeMap, myIndex, buildInitialOthers, bossStartPos.x, bossStartPos.y, sprintUntilRef, isSprintingRef])
 
   useEffect(() => { resetMatchRef.current = resetMatch }, [resetMatch])
 
@@ -655,67 +692,6 @@ export default function BossRaidArena({ room, players, warrior, session, onBack,
     resetMatch()
     broadcast('restart', {})
   }, [resetMatch, broadcast])
-
-  useEffect(() => {
-    const handleKeyDown = (e) => {
-      if (matchPhaseRef.current !== 'fighting') return
-      const k = e.key.toLowerCase()
-      keys.current[k] = true
-
-      if (['w', 'a', 's', 'd'].includes(k)) {
-        const now = Date.now()
-        if (lastTap.current.key === k && now - lastTap.current.time < 300 && now > sprintCooldownRef.current) {
-          sprintUntilRef.current = now + SPRINT_DURATION_MS
-          sprintCooldownRef.current = now + SPRINT_COOLDOWN_MS
-          setIsSprinting(true)
-        }
-        lastTap.current = { key: k, time: now }
-      }
-
-      if (k === 'q') activateSkill()
-    }
-
-    const handleKeyUp = (e) => {
-      const k = e.key.toLowerCase()
-      keys.current[k] = false
-      if (k === 'f') reviveHoldRef.current = { targetId: null, startedAt: 0 }
-    }
-
-    window.addEventListener('keydown', handleKeyDown)
-    window.addEventListener('keyup', handleKeyUp)
-    return () => {
-      window.removeEventListener('keydown', handleKeyDown)
-      window.removeEventListener('keyup', handleKeyUp)
-    }
-  }, [activateSkill])
-
-  useEffect(() => {
-    const handleMouseMove = (e) => {
-      if (meRef.current.downed || meRef.current.eliminated) return
-      const worldX = (e.clientX - mapOffsetRef.current.x) / MAP_SCALE
-      const worldY = (e.clientY - mapOffsetRef.current.y) / MAP_SCALE
-      setMe((prev) => ({ ...prev, angle: Math.atan2(worldY - prev.y, worldX - prev.x) }))
-    }
-    const handleMouseDown = (e) => {
-      if (e.button !== 0) return
-      mouseDown.current = true
-      if (matchPhaseRef.current !== 'fighting') return
-      if (weaponConfig.mode !== 'auto') performAttack()
-    }
-    const handleMouseUp = (e) => { if (e.button === 0) mouseDown.current = false }
-    const handleBlur = () => { mouseDown.current = false }
-
-    window.addEventListener('mousemove', handleMouseMove)
-    window.addEventListener('mousedown', handleMouseDown)
-    window.addEventListener('mouseup', handleMouseUp)
-    window.addEventListener('blur', handleBlur)
-    return () => {
-      window.removeEventListener('mousemove', handleMouseMove)
-      window.removeEventListener('mousedown', handleMouseDown)
-      window.removeEventListener('mouseup', handleMouseUp)
-      window.removeEventListener('blur', handleBlur)
-    }
-  }, [performAttack, weaponConfig.mode])
 
   useEffect(() => {
     if (matchPhase !== 'fighting') return
@@ -874,6 +850,7 @@ export default function BossRaidArena({ room, players, warrior, session, onBack,
   }, [
     matchPhase, spawnProjectile, hitBoss, broadcast, broadcastOwnState, activeMap,
     myId, orderedPlayers, checkRaidFailed, reviveProgress, isHost,
+    keys, mouseDown, sprintUntilRef, isSprintingRef, setIsSprinting,
   ])
 
   useEffect(() => {
@@ -977,7 +954,7 @@ export default function BossRaidArena({ room, players, warrior, session, onBack,
       style={{
         position: 'fixed', top: 0, left: 0, width: '100vw', height: '100vh',
         backgroundColor: '#0c0505',
-        overflow: 'hidden', userSelect: 'none', cursor: 'crosshair', zIndex: 9999,
+        overflow: 'hidden', userSelect: 'none', cursor: isMobile ? 'default' : 'crosshair', zIndex: 9999,
       }}
     >
       {/* 摄像机 viewport：地图 + 所有世界坐标物体在同一层，固定居中显示 */}
@@ -1126,14 +1103,14 @@ export default function BossRaidArena({ room, players, warrior, session, onBack,
         {myConcealed && !me.downed && (
           <div style={{ marginTop: 6, fontSize: 12, fontWeight: 'bold', color: '#2ecc71' }}>🌿 隐蔽中</div>
         )}
-        {skillConfig && (
+        {skillConfig && !isMobile && (
           <div style={{ marginTop: 8, fontSize: 12, fontWeight: 'bold', color: skillActiveNow ? skillConfig.color : skillReady ? '#fff' : '#666' }}>
             {skillActiveNow ? skillConfig.icon + ' ' + skillConfig.label + ' ACTIVE' : skillReady ? 'Q — ' + skillConfig.label + ' READY' : 'Q — CD ' + Math.max(0, (skillCooldownUntil - Date.now()) / 1000).toFixed(1) + 's'}
           </div>
         )}
         {me.downed && !me.eliminated && (
           <div style={{ marginTop: 8, fontSize: 12, fontWeight: 'bold', color: '#ff8a8a' }}>
-            🩸 等待队友按住 F 救援… {Math.max(0, Math.ceil((BLEED_OUT_MS - (Date.now() - me.downedAt)) / 1000))}s
+            🩸 等待队友{isMobile ? '按住 REVIVE 按钮' : '按住 F'}救援… {Math.max(0, Math.ceil((BLEED_OUT_MS - (Date.now() - me.downedAt)) / 1000))}s
           </div>
         )}
       </div>
@@ -1156,17 +1133,39 @@ export default function BossRaidArena({ room, players, warrior, session, onBack,
         })}
       </div>
 
-      {/* 战斗日志 */}
-      <div style={{ position: 'absolute', bottom: 20, left: 20, zIndex: 100, background: 'rgba(0,0,0,0.7)', padding: 15, borderRadius: 8, color: '#fff', maxWidth: 320 }}>
-        {logs.map((log, i) => <div key={i} style={{ marginBottom: 4, fontSize: 13 }}>{log}</div>)}
-      </div>
+      {/* 战斗日志（手机上屏幕太挤，隐藏掉，留给虚拟摇杆） */}
+      {!isMobile && (
+        <div style={{ position: 'absolute', bottom: 20, left: 20, zIndex: 100, background: 'rgba(0,0,0,0.7)', padding: 15, borderRadius: 8, color: '#fff', maxWidth: 320 }}>
+          {logs.map((log, i) => <div key={i} style={{ marginBottom: 4, fontSize: 13 }}>{log}</div>)}
+        </div>
+      )}
 
-      <div style={{ position: 'absolute', bottom: 20, left: '50%', transform: 'translateX(-50%)', zIndex: 100, background: 'rgba(0,0,0,0.7)', padding: '8px 16px', borderRadius: 8, color: '#aaa', fontSize: 12 }}>
-        WASD 移动 · 点击左键攻击 Boss · Q 技能 · 长按 F 救援倒地队友
-      </div>
+      {!isMobile && (
+        <div style={{ position: 'absolute', bottom: 20, left: '50%', transform: 'translateX(-50%)', zIndex: 100, background: 'rgba(0,0,0,0.7)', padding: '8px 16px', borderRadius: 8, color: '#aaa', fontSize: 12 }}>
+          WASD 移动 · 点击左键攻击 Boss · Q 技能 · 长按 F 救援倒地队友
+        </div>
+      )}
 
       {matchPhase === 'countdown' && (
         <MatchCountdown title="BOSS RAID" onComplete={() => setMatchPhase('fighting')} />
+      )}
+
+      {/* 手机端虚拟摇杆 + 开火/冲刺/技能/救援按钮 */}
+      {isMobile && matchPhase === 'fighting' && (
+        <MobileControlsOverlay
+          onMove={handleMoveJoystick}
+          onAim={handleAimJoystick}
+          onFireStart={handleFireStart}
+          onFireEnd={handleFireEnd}
+          onSprintStart={handleSprintStart}
+          onSprintEnd={handleSprintEnd}
+          isSprinting={isSprinting}
+          onSkillTap={handleSkillTap}
+          skillConfig={skillConfig}
+          skillReady={skillReady}
+          onReviveStart={handleReviveStart}
+          onReviveEnd={handleReviveEnd}
+        />
       )}
 
       <button
