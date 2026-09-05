@@ -24,6 +24,9 @@
      blocksMovement,      // 是否挡玩家移动
    }
 ===================================================== */
+export function getMapPixelSize(map) {
+  return { width: map.width * map.tileSize, height: map.height * map.tileSize }
+}
 
 export const TILE_SIZE = 40
 
@@ -37,7 +40,7 @@ export const TERRAIN = {
 
 export const TERRAIN_STYLE = {
   [TERRAIN.EMPTY]: { bg: '#1c1d24', label: '' },
-  [TERRAIN.GRASS]: { bg: '#1f3a24', label: '🌱' },
+  [TERRAIN.GRASS]: { bg: '#1f3a24', label: '' },
   [TERRAIN.TALL_GRASS]: { bg: '#2c5c33', label: '🌿' },
   [TERRAIN.DIRT]: { bg: '#4a3a2a', label: '' },
   [TERRAIN.WATER]: { bg: '#1a3d5c', label: '' },
@@ -104,7 +107,7 @@ function obj(id, type, tileX, tileY, extra = {}) {
    "Size: 1200 × 800"
 ===================================================== */
 function buildGrassland01() {
-  const width = 30
+  const width = 35
   const height = 20
   const tiles = makeEmptyTiles(width, height, TERRAIN.GRASS)
 

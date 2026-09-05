@@ -8,21 +8,6 @@ import MatchCountdown from './MatchCountdown'
 
 /* =====================================================
    FREE FOR ALL（最多 8 人，无队伍，人人都是敌人）
-   ─────────────────────────────────────────────────────
-   跟 PvpArena / TeamBattleArena 共用同一套"每个客户端只对
-   自己的血量/存活状态权威"的实时架构：
-   - me            : 本地玩家，权威（位置 / HP / 存活 / 击杀数）
-   - others[id]     : 其余最多 7 人的最新已知状态（来自 broadcast）
-   - 没有队伍概念，Object.values(others) 里活着的都是目标
-
-   与 1v1 / 2v2 的差异：
-   - 死亡不是"淘汰"，而是 RESPAWN_MS 后原地复活满血，
-     不会因为死亡退出游戏
-   - 击杀计分：谁把你打死，谁的 kills +1（从你自己广播的
-     'death' 事件里带上 killerId，killerId 由"最后一次让你
-     掉血到 0 的那次 hit 事件的 senderId"决定）
-   - 胜负不取决于存活，而是 MATCH_DURATION_MS 倒计时结束后
-     按 kills 排行榜决定名次
 ===================================================== */
 
 const HIT_RADIUS = 20
@@ -33,7 +18,6 @@ const OTHER_LERP = 0.25
 const RESPAWN_MS = 3000
 const MATCH_DURATION_MS = 5 * 60 * 1000
 
-/* 点到线段的最短距离，用于 hitscan（狙击枪/激光枪）命中判定 */
 function pointToSegmentDistance(px, py, x1, y1, x2, y2) {
   const dx = x2 - x1
   const dy = y2 - y1
@@ -57,8 +41,6 @@ function weaponHint(weaponConfig) {
   }
 }
 
-/* 随机挑一个出生格：优先用地图配置的出生点池（team1+team2+neutral），
-   没有的话就在地图里找一个没被物体挡住的格子，最后兜底用地图中心 */
 function pickSpawnTile(map) {
   const pool = [
     ...(map.spawns?.team1 || []),
@@ -91,7 +73,7 @@ function formatClock(ms) {
 const RANK_MEDAL = ['🏆', '🥈', '🥉']
 
 /* =====================================================
-   小组件：战斗角色（死亡时不渲染，由父组件控制）
+   小组件
 ===================================================== */
 function FFAFighterAvatar({ x, y, angle, color, emoji, isSelf, isFlashing, flashColor }) {
   return (
@@ -140,7 +122,28 @@ export default function FFAArena({ room, players, warrior, session, onBack, map,
   const myId = session.user.id
   const isHost = room?.host_id === myId
   const activeMap = map || room?.map_data || BUILTIN_MAPS[0]
+  const mapPxW = activeMap.width * activeMap.tileSize
+  const mapPxH = activeMap.height * activeMap.tileSize
   const orderedPlayers = players
+
+  // 地图永远居中显示在屏幕正中间，不跟随玩家移动。
+  const MAP_SCALE = 0.7
+  const [mapOffset, setMapOffset] = useState({ x: 0, y: 0 })
+  const mapOffsetRef = useRef({ x: 0, y: 0 })
+
+  useEffect(() => {
+    const computeOffset = () => {
+      const offset = {
+        x: (window.innerWidth - mapPxW * MAP_SCALE) / 2,
+        y: (window.innerHeight - mapPxH * MAP_SCALE) / 2,
+      }
+      mapOffsetRef.current = offset
+      setMapOffset(offset)
+    }
+    computeOffset()
+    window.addEventListener('resize', computeOffset)
+    return () => window.removeEventListener('resize', computeOffset)
+  }, [mapPxW, mapPxH])
 
   const myWarrior = warrior
   const classConfig = Classes[myWarrior.outfit] || Classes.warrior
@@ -186,10 +189,9 @@ export default function FFAArena({ room, players, warrior, session, onBack, map,
 
   const [skillState, setSkillState] = useState({ active: false, until: 0, type: null })
   const [skillCooldownUntil, setSkillCooldownUntil] = useState(0)
-  const [flash, setFlash] = useState(null) // { who: 'me' | id, color, until }
+  const [flash, setFlash] = useState(null)
   const [isSprinting, setIsSprinting] = useState(false)
 
-  // 'countdown' -> 'fighting' -> 'ended'
   const [matchPhase, setMatchPhase] = useState('countdown')
   const matchPhaseRef = useRef('countdown')
   useEffect(() => { matchPhaseRef.current = matchPhase }, [matchPhase])
@@ -204,7 +206,6 @@ export default function FFAArena({ room, players, warrior, session, onBack, map,
 
   const matchEndedRef = useRef(false)
 
-  /* ---------------- refs：避免 rAF 循环里的闭包问题 ---------------- */
   const meRef = useRef(me)
   const othersRef = useRef(others)
   const projectilesRef = useRef(projectiles)
@@ -262,9 +263,6 @@ export default function FFAArena({ room, players, warrior, session, onBack, map,
     })
   }, [broadcast, activeMap])
 
-  /* =========================================================
-     承受伤害：本地永远是自己血量/存活状态的权威
-  ========================================================= */
   const applyIncomingHit = useCallback((payload) => {
     if (matchEndedRef.current || !meRef.current.alive) return
     const now = Date.now()
@@ -290,8 +288,8 @@ export default function FFAArena({ room, players, warrior, session, onBack, map,
       const newHp = Math.max(0, prev.hp - finalDamage)
       const pushX = payload.pushX || 0
       const pushY = payload.pushY || 0
-      const nextX = Math.max(20, Math.min(window.innerWidth - 20, prev.x + pushX))
-      const nextY = Math.max(20, Math.min(window.innerHeight - 20, prev.y + pushY))
+      const nextX = Math.max(20, Math.min(mapPxW - 20, prev.x + pushX))
+      const nextY = Math.max(20, Math.min(mapPxH - 20, prev.y + pushY))
 
       if (newHp === 0 && prev.alive) {
         respawnAtRef.current = Date.now() + RESPAWN_MS
@@ -314,9 +312,6 @@ export default function FFAArena({ room, players, warrior, session, onBack, map,
     }
   }, [addLog, addDamageText, broadcast, broadcastOwnState])
 
-  /* =========================================================
-     Realtime 频道
-  ========================================================= */
   useEffect(() => {
     const channel = supabase.channel('pvp-arena-' + room.id, {
       config: { broadcast: { self: false } },
@@ -396,9 +391,6 @@ export default function FFAArena({ room, players, warrior, session, onBack, map,
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [room.id, applyIncomingHit])
 
-  /* =========================================================
-     发起伤害
-  ========================================================= */
   const dealDamageToTarget = useCallback((targetId, damage, angle, knockback) => {
     const target = othersRef.current[targetId]
     if (!target || !target.alive) return
@@ -518,9 +510,6 @@ export default function FFAArena({ room, players, warrior, session, onBack, map,
     setTimeout(() => broadcast('skill', { active: false }), skillConfig.durationMs)
   }, [skillConfig, addLog, broadcast])
 
-  /* =========================================================
-     重开一局
-  ========================================================= */
   const resetMatch = useCallback(() => {
     const pos = spawnPixel(activeMap, pickSpawnTile(activeMap))
     setMe({
@@ -560,9 +549,6 @@ export default function FFAArena({ room, players, warrior, session, onBack, map,
     broadcast('restart', {})
   }, [resetMatch, broadcast])
 
-  /* =========================================================
-     输入：键盘（移动 + 连按冲刺 + Q 技能）
-  ========================================================= */
   useEffect(() => {
     const handleKeyDown = (e) => {
       if (matchPhaseRef.current !== 'fighting') return
@@ -596,11 +582,12 @@ export default function FFAArena({ room, players, warrior, session, onBack, map,
     }
   }, [activateSkill])
 
-  /* ---------------- 输入：鼠标 ---------------- */
   useEffect(() => {
     const handleMouseMove = (e) => {
       if (!meRef.current.alive) return
-      setMe((prev) => ({ ...prev, angle: Math.atan2(e.clientY - prev.y, e.clientX - prev.x) }))
+      const worldX = (e.clientX - mapOffsetRef.current.x) / MAP_SCALE
+      const worldY = (e.clientY - mapOffsetRef.current.y) / MAP_SCALE
+      setMe((prev) => ({ ...prev, angle: Math.atan2(worldY - prev.y, worldX - prev.x) }))
     }
     const handleMouseDown = (e) => {
       if (e.button !== 0) return
@@ -623,9 +610,6 @@ export default function FFAArena({ room, players, warrior, session, onBack, map,
     }
   }, [performAttack, weaponConfig.mode])
 
-  /* =========================================================
-     主循环
-  ========================================================= */
   useEffect(() => {
     if (matchPhase !== 'fighting') return
 
@@ -636,7 +620,6 @@ export default function FFAArena({ room, players, warrior, session, onBack, map,
       const currentClass = classConfigRef.current
       const canAct = cur.alive
 
-      // 0. 复活倒计时
       if (!cur.alive) {
         const msLeft = respawnAtRef.current - now
         setRespawnMsLeft(Math.max(0, msLeft))
@@ -649,7 +632,6 @@ export default function FFAArena({ room, players, warrior, session, onBack, map,
         }
       }
 
-      // 1. 移动 + 冲刺
       if (canAct) {
         let dx = 0
         let dy = 0
@@ -670,8 +652,8 @@ export default function FFAArena({ room, players, warrior, session, onBack, map,
           const len = Math.sqrt(dx * dx + dy * dy)
           dx /= len
           dy /= len
-          let nx = Math.max(20, Math.min(window.innerWidth - 20, cur.x + dx * speed))
-          let ny = Math.max(20, Math.min(window.innerHeight - 20, cur.y + dy * speed))
+          let nx = Math.max(20, Math.min(mapPxW - 20, cur.x + dx * speed))
+          let ny = Math.max(20, Math.min(mapPxH - 20, cur.y + dy * speed))
           const resolved = resolveWallCollision(activeMap, nx, ny, 18)
           nx = resolved.x
           ny = resolved.y
@@ -679,7 +661,6 @@ export default function FFAArena({ room, players, warrior, session, onBack, map,
         }
       }
 
-      // 2. 其他玩家位置插值
       setOthers((prev) => {
         const next = { ...prev }
         Object.keys(next).forEach((id) => {
@@ -699,13 +680,12 @@ export default function FFAArena({ room, players, warrior, session, onBack, map,
         return next
       })
 
-      // 3. 我方子弹移动 + 命中判定 —— 先结算旧子弹
       const remaining = []
       const opponents = Object.values(othersRef.current).filter((f) => f.alive)
       for (const p of projectilesRef.current) {
         const nx = p.x + Math.cos(p.angle) * p.speed
         const ny = p.y + Math.sin(p.angle) * p.speed
-        const inBounds = nx > 0 && nx < window.innerWidth && ny > 0 && ny < window.innerHeight
+        const inBounds = nx > 0 && nx < mapPxW && ny > 0 && ny < mapPxH
         const wallHit = inBounds && isBulletBlocked(activeMap, p.x, p.y, nx, ny).blocked
         if (wallHit) continue
 
@@ -730,7 +710,6 @@ export default function FFAArena({ room, players, warrior, session, onBack, map,
       }
       setProjectiles(remaining)
 
-      // 4. 连发武器 —— 放在旧子弹结算之后再追加新子弹
       if (canAct && currentWeapon.mode === 'auto' && mouseDown.current && !matchEndedRef.current) {
         const interval = currentWeapon.cooldown * (currentClass.attackSpeedMultiplier || 1)
         if (now - lastAutoFireAt.current >= interval) {
@@ -739,16 +718,13 @@ export default function FFAArena({ room, players, warrior, session, onBack, map,
         }
       }
 
-      // 5. 对方子弹的视觉飞行
       setIncomingProjectiles((prev) => prev
         .map((p) => ({ ...p, x: p.x + Math.cos(p.angle) * p.speed, y: p.y + Math.sin(p.angle) * p.speed }))
         .filter((p) => Date.now() - p.spawnedAt < 3000))
 
-      // 6. 草丛可见性
       const outgoingVisibility = shapeOutgoingVisibility(activeMap, meRef.current, revealUntilRef)
       setMyConcealed(outgoingVisibility.concealed)
 
-      // 7. 定期广播自己的状态
       if (now - lastBroadcastAt.current > STATE_BROADCAST_MS) {
         lastBroadcastAt.current = now
         broadcast('state', {
@@ -759,7 +735,6 @@ export default function FFAArena({ room, players, warrior, session, onBack, map,
         })
       }
 
-      // 8. 比赛计时
       const remainingMs = matchEndAtRef.current - now
       setTimeLeftMs(Math.max(0, remainingMs))
       if (remainingMs <= 0 && !matchEndedRef.current) {
@@ -775,9 +750,6 @@ export default function FFAArena({ room, players, warrior, session, onBack, map,
     return () => cancelAnimationFrame(animationFrameRef.current)
   }, [matchPhase, spawnProjectile, dealDamageToTarget, broadcast, broadcastOwnState, activeMap])
 
-  /* =========================================================
-     渲染
-  ========================================================= */
   const myFlashActive = flash?.who === 'me' && Date.now() < flash.until
   const skillReady = skillConfig && Date.now() >= skillCooldownUntil
   const skillActiveNow = skillState.active && Date.now() < skillState.until
@@ -786,7 +758,6 @@ export default function FFAArena({ room, players, warrior, session, onBack, map,
     map: activeMap, myPos: me, enemyPos: f, enemyRevealUntil: f.revealUntil || 0, now: Date.now(),
   })
 
-  // 排行榜：自己 + 所有已知其他玩家，按 kills 降序
   const leaderboard = [
     { id: myId, isSelf: true, kills: me.kills, deaths: me.deaths },
     ...Object.values(others).map((f) => ({ id: f.id, isSelf: false, kills: f.kills, index: f.index })),
@@ -797,13 +768,132 @@ export default function FFAArena({ room, players, warrior, session, onBack, map,
       style={{
         position: 'fixed', top: 0, left: 0, width: '100vw', height: '100vh',
         backgroundColor: '#090909',
-        backgroundImage: 'linear-gradient(rgba(255,255,255,0.03) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.03) 1px, transparent 1px)',
-        backgroundSize: '50px 50px',
         overflow: 'hidden', userSelect: 'none', cursor: 'crosshair', zIndex: 9999,
       }}
     >
-      <div style={{ position: 'absolute', top: 0, left: 0, zIndex: 1 }}>
-        <MapRenderer map={activeMap} />
+      {/* 摄像机 viewport：地图 + 所有世界坐标物体在同一层，固定居中显示 */}
+      <div style={{ position: 'absolute', inset: 0, overflow: 'hidden' }}>
+        <div style={{ position: 'absolute', top: 0, left: 0, transform: `translate(${mapOffset.x}px, ${mapOffset.y}px) scale(${MAP_SCALE})`, transformOrigin: '0 0' }}>
+          <MapRenderer map={activeMap} />
+
+          {/* 地图边界：亮红色描边 */}
+          <div style={{
+            position: 'absolute', left: 0, top: 0, width: mapPxW, height: mapPxH,
+            border: '4px solid #ff2e2e',
+            boxShadow: '0 0 20px 4px rgba(255,46,46,0.6), inset 0 0 16px 4px rgba(255,46,46,0.25)',
+            pointerEvents: 'none', zIndex: 5,
+          }} />
+
+          {/* 我方角色 */}
+          {me.alive && (
+            <FFAFighterAvatar
+              x={me.x} y={me.y} angle={me.angle} color={classConfig.color} emoji={outfits[myWarrior.outfit] || '🧑‍⚔️'}
+              isSelf isFlashing={myFlashActive} flashColor={flash?.color}
+            />
+          )}
+
+          {/* 其他玩家 */}
+          {Object.values(others).map((f) => {
+            if (!f.alive) return null
+            if (!canSeeFighter(f)) return null
+            const otherWarrior = f.warrior || {}
+            const otherClass = Classes[otherWarrior.outfit] || Classes.warrior
+            const otherFlashing = flash?.who === f.id && Date.now() < flash.until
+            return (
+              <FFAFighterAvatar
+                key={f.id}
+                x={f.x} y={f.y} angle={f.angle} color={otherClass.color} emoji={outfits[otherWarrior.outfit] || '🧑‍⚔️'}
+                isSelf={false} isFlashing={otherFlashing} flashColor={flash?.color}
+              />
+            )
+          })}
+
+          {/* 我方技能光环 */}
+          {skillActiveNow && (
+            <div style={{
+              position: 'absolute', left: me.x, top: me.y, width: 64, height: 64,
+              transform: 'translate(-50%, -50%)', borderRadius: '50%',
+              border: skillState.type === 'shield' ? '3px solid #3ea6ff' : '3px dashed #ff4d4d',
+              boxShadow: skillState.type === 'shield' ? '0 0 18px 4px rgba(62,166,255,0.7)' : '0 0 18px 4px rgba(255,77,77,0.7)',
+              pointerEvents: 'none', zIndex: 9,
+            }} />
+          )}
+
+          {/* 其他人的技能光环 */}
+          {Object.values(others).map((f) => {
+            if (!f.skillActive || !f.alive || !canSeeFighter(f)) return null
+            return (
+              <div key={'skill-' + f.id} style={{
+                position: 'absolute', left: f.x, top: f.y, width: 64, height: 64,
+                transform: 'translate(-50%, -50%)', borderRadius: '50%',
+                border: f.skillType === 'shield' ? '3px solid #3ea6ff' : '3px dashed #ff4d4d',
+                boxShadow: f.skillType === 'shield' ? '0 0 18px 4px rgba(62,166,255,0.7)' : '0 0 18px 4px rgba(255,77,77,0.7)',
+                pointerEvents: 'none', zIndex: 9,
+              }} />
+            )
+          })}
+
+          {/* 我方子弹 */}
+          {projectiles.map((p) => (
+            <div key={p.id} style={{
+              position: 'absolute', left: p.x, top: p.y, width: p.size * 2, height: p.size * 2,
+              borderRadius: '50%', backgroundColor: p.color, boxShadow: `0 0 5px ${p.color}`,
+              transform: 'translate(-50%, -50%)', zIndex: 8,
+            }} />
+          ))}
+
+          {/* 其他人子弹（视觉） */}
+          {incomingProjectiles.map((p) => (
+            <div key={p.id} style={{
+              position: 'absolute', left: p.x, top: p.y, width: p.size * 2, height: p.size * 2,
+              borderRadius: '50%', backgroundColor: p.color, boxShadow: `0 0 5px ${p.color}`,
+              transform: 'translate(-50%, -50%)', zIndex: 8, opacity: 0.85,
+            }} />
+          ))}
+
+          {/* 光束 */}
+          {beams.filter((b) => Date.now() < b.until).map((b) => {
+            const dx = b.x2 - b.x1
+            const dy = b.y2 - b.y1
+            const length = Math.hypot(dx, dy)
+            const angle = Math.atan2(dy, dx)
+            return (
+              <div key={b.id} style={{
+                position: 'absolute', left: b.x1, top: b.y1, width: length, height: 3,
+                background: b.color, boxShadow: `0 0 8px ${b.color}`,
+                transform: `rotate(${angle}rad)`, transformOrigin: '0 50%',
+                opacity: 0.9, zIndex: 9, pointerEvents: 'none',
+              }} />
+            )
+          })}
+
+          {/* 爆炸 */}
+          {explosions.filter((e) => Date.now() < e.until).map((e) => {
+            const progress = 1 - (e.until - Date.now()) / 400
+            const size = e.radius * 2 * (0.5 + progress * 0.6)
+            return (
+              <div key={e.id} style={{
+                position: 'absolute', left: e.x, top: e.y, width: size, height: size, borderRadius: '50%',
+                background: 'radial-gradient(circle, rgba(255,220,120,1) 0%, rgba(255,100,30,0.9) 40%, rgba(192,57,43,0) 100%)',
+                transform: 'translate(-50%, -50%)', opacity: 1 - progress, pointerEvents: 'none', zIndex: 15,
+              }} />
+            )
+          })}
+
+          {/* 伤害数字 */}
+          {damageTexts.filter((d) => Date.now() < d.until).map((d) => {
+            const progress = 1 - (d.until - Date.now()) / 800
+            return (
+              <div key={d.id} style={{
+                position: 'absolute', left: d.x, top: d.y - progress * 40, transform: 'translate(-50%, -50%)',
+                color: d.color, fontWeight: 'bold', fontSize: 18, opacity: 1 - progress,
+                textShadow: '0 0 4px rgba(0,0,0,0.8)', zIndex: 20, pointerEvents: 'none',
+              }}>
+                {d.text}
+              </div>
+            )
+          })}
+        </div>
       </div>
 
       {/* 我方 HUD */}
@@ -850,7 +940,7 @@ export default function FFAArena({ room, players, warrior, session, onBack, map,
         ⏱️ {formatClock(timeLeftMs)}
       </div>
 
-      {/* 排行榜（右上角，实时） */}
+      {/* 排行榜 */}
       <div style={{ position: 'absolute', top: 20, right: 20, zIndex: 100, background: 'rgba(0,0,0,0.7)', padding: 12, borderRadius: 8, color: '#fff', minWidth: 180 }}>
         <div style={{ fontSize: 12, color: '#aaa', marginBottom: 6, fontWeight: 'bold' }}>LEADERBOARD</div>
         {leaderboard.slice(0, 8).map((row, i) => (
@@ -864,116 +954,6 @@ export default function FFAArena({ room, players, warrior, session, onBack, map,
           </div>
         ))}
       </div>
-
-      {/* 我方角色 */}
-      {me.alive && (
-        <FFAFighterAvatar
-          x={me.x} y={me.y} angle={me.angle} color={classConfig.color} emoji={outfits[myWarrior.outfit] || '🧑‍⚔️'}
-          isSelf isFlashing={myFlashActive} flashColor={flash?.color}
-        />
-      )}
-
-      {/* 其他玩家（死亡/不在视野内的不渲染） */}
-      {Object.values(others).map((f) => {
-        if (!f.alive) return null
-        if (!canSeeFighter(f)) return null
-        const otherWarrior = f.warrior || {}
-        const otherClass = Classes[otherWarrior.outfit] || Classes.warrior
-        const otherFlashing = flash?.who === f.id && Date.now() < flash.until
-        return (
-          <FFAFighterAvatar
-            key={f.id}
-            x={f.x} y={f.y} angle={f.angle} color={otherClass.color} emoji={outfits[otherWarrior.outfit] || '🧑‍⚔️'}
-            isSelf={false} isFlashing={otherFlashing} flashColor={flash?.color}
-          />
-        )
-      })}
-
-      {/* 我方技能光环 */}
-      {skillActiveNow && (
-        <div style={{
-          position: 'absolute', left: me.x, top: me.y, width: 64, height: 64,
-          transform: 'translate(-50%, -50%)', borderRadius: '50%',
-          border: skillState.type === 'shield' ? '3px solid #3ea6ff' : '3px dashed #ff4d4d',
-          boxShadow: skillState.type === 'shield' ? '0 0 18px 4px rgba(62,166,255,0.7)' : '0 0 18px 4px rgba(255,77,77,0.7)',
-          pointerEvents: 'none', zIndex: 9,
-        }} />
-      )}
-
-      {/* 其他人的技能光环 */}
-      {Object.values(others).map((f) => {
-        if (!f.skillActive || !f.alive || !canSeeFighter(f)) return null
-        return (
-          <div key={'skill-' + f.id} style={{
-            position: 'absolute', left: f.x, top: f.y, width: 64, height: 64,
-            transform: 'translate(-50%, -50%)', borderRadius: '50%',
-            border: f.skillType === 'shield' ? '3px solid #3ea6ff' : '3px dashed #ff4d4d',
-            boxShadow: f.skillType === 'shield' ? '0 0 18px 4px rgba(62,166,255,0.7)' : '0 0 18px 4px rgba(255,77,77,0.7)',
-            pointerEvents: 'none', zIndex: 9,
-          }} />
-        )
-      })}
-
-      {/* 我方子弹 */}
-      {projectiles.map((p) => (
-        <div key={p.id} style={{
-          position: 'absolute', left: p.x, top: p.y, width: p.size * 2, height: p.size * 2,
-          borderRadius: '50%', backgroundColor: p.color, boxShadow: `0 0 5px ${p.color}`,
-          transform: 'translate(-50%, -50%)', zIndex: 8,
-        }} />
-      ))}
-
-      {/* 其他人子弹（视觉） */}
-      {incomingProjectiles.map((p) => (
-        <div key={p.id} style={{
-          position: 'absolute', left: p.x, top: p.y, width: p.size * 2, height: p.size * 2,
-          borderRadius: '50%', backgroundColor: p.color, boxShadow: `0 0 5px ${p.color}`,
-          transform: 'translate(-50%, -50%)', zIndex: 8, opacity: 0.85,
-        }} />
-      ))}
-
-      {/* 光束 */}
-      {beams.filter((b) => Date.now() < b.until).map((b) => {
-        const dx = b.x2 - b.x1
-        const dy = b.y2 - b.y1
-        const length = Math.hypot(dx, dy)
-        const angle = Math.atan2(dy, dx)
-        return (
-          <div key={b.id} style={{
-            position: 'absolute', left: b.x1, top: b.y1, width: length, height: 3,
-            background: b.color, boxShadow: `0 0 8px ${b.color}`,
-            transform: `rotate(${angle}rad)`, transformOrigin: '0 50%',
-            opacity: 0.9, zIndex: 9, pointerEvents: 'none',
-          }} />
-        )
-      })}
-
-      {/* 爆炸 */}
-      {explosions.filter((e) => Date.now() < e.until).map((e) => {
-        const progress = 1 - (e.until - Date.now()) / 400
-        const size = e.radius * 2 * (0.5 + progress * 0.6)
-        return (
-          <div key={e.id} style={{
-            position: 'absolute', left: e.x, top: e.y, width: size, height: size, borderRadius: '50%',
-            background: 'radial-gradient(circle, rgba(255,220,120,1) 0%, rgba(255,100,30,0.9) 40%, rgba(192,57,43,0) 100%)',
-            transform: 'translate(-50%, -50%)', opacity: 1 - progress, pointerEvents: 'none', zIndex: 15,
-          }} />
-        )
-      })}
-
-      {/* 伤害数字 */}
-      {damageTexts.filter((d) => Date.now() < d.until).map((d) => {
-        const progress = 1 - (d.until - Date.now()) / 800
-        return (
-          <div key={d.id} style={{
-            position: 'absolute', left: d.x, top: d.y - progress * 40, transform: 'translate(-50%, -50%)',
-            color: d.color, fontWeight: 'bold', fontSize: 18, opacity: 1 - progress,
-            textShadow: '0 0 4px rgba(0,0,0,0.8)', zIndex: 20, pointerEvents: 'none',
-          }}>
-            {d.text}
-          </div>
-        )
-      })}
 
       {/* 战斗日志 */}
       <div style={{ position: 'absolute', bottom: 20, left: 20, zIndex: 100, background: 'rgba(0,0,0,0.7)', padding: 15, borderRadius: 8, color: '#fff', maxWidth: 320 }}>
@@ -999,7 +979,7 @@ export default function FFAArena({ room, players, warrior, session, onBack, map,
         LEAVE MATCH
       </button>
 
-      {/* 结算画面：时间到，按 kills 排名 */}
+      {/* 结算画面 */}
       {matchPhase === 'ended' && (
         <div style={{
           position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)', zIndex: 200,

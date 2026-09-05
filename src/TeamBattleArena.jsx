@@ -123,7 +123,28 @@ export default function TeamBattleArena({ room, players, warrior, session, onBac
   const myId = session.user.id
   const isHost = room?.host_id === myId
   const activeMap = map || room?.map_data || BUILTIN_MAPS[0]
+  const mapPxW = activeMap.width * activeMap.tileSize
+  const mapPxH = activeMap.height * activeMap.tileSize
 
+  // 地图永远居中显示在屏幕正中间，不跟随玩家移动。
+  // 只在窗口大小变化时重新计算一次偏移量，不需要每帧更新。
+  const MAP_SCALE = 0.7
+  const [mapOffset, setMapOffset] = useState({ x: 0, y: 0 })
+  const mapOffsetRef = useRef({ x: 0, y: 0 })
+
+  useEffect(() => {
+    const computeOffset = () => {
+      const offset = {
+        x: (window.innerWidth - mapPxW * MAP_SCALE) / 2,
+        y: (window.innerHeight - mapPxH * MAP_SCALE) / 2,
+      }
+      mapOffsetRef.current = offset
+      setMapOffset(offset)
+    }
+    computeOffset()
+    window.addEventListener('resize', computeOffset)
+    return () => window.removeEventListener('resize', computeOffset)
+  }, [mapPxW, mapPxH])
   // 队伍完全由 battle_room_players.team 决定（1=RED / 2=BLUE），
   // 不再看加入顺序。RoomPage 已经保证了两边都至少 1 人才能开局。
   const orderedPlayers = players
@@ -320,8 +341,8 @@ export default function TeamBattleArena({ room, players, warrior, session, onBac
       const newHp = Math.max(0, prev.hp - finalDamage)
       const pushX = payload.pushX || 0
       const pushY = payload.pushY || 0
-      const nextX = Math.max(20, Math.min(window.innerWidth - 20, prev.x + pushX))
-      const nextY = Math.max(20, Math.min(window.innerHeight - 20, prev.y + pushY))
+      const nextX = Math.max(20, Math.min(mapPxW - 20, prev.x + pushX))
+      const nextY = Math.max(20, Math.min(mapPxH - 20, prev.y + pushY))
 
       if (newHp === 0 && prev.alive) {
         respawnAtRef.current = Date.now() + RESPAWN_MS
@@ -649,7 +670,9 @@ export default function TeamBattleArena({ room, players, warrior, session, onBac
   useEffect(() => {
     const handleMouseMove = (e) => {
       if (!meRef.current.alive) return
-      setMe((prev) => ({ ...prev, angle: Math.atan2(e.clientY - prev.y, e.clientX - prev.x) }))
+      const worldX = (e.clientX - mapOffsetRef.current.x) / MAP_SCALE
+      const worldY = (e.clientY - mapOffsetRef.current.y) / MAP_SCALE
+      setMe((prev) => ({ ...prev, angle: Math.atan2(worldY - prev.y, worldX - prev.x) }))
     }
     const handleMouseDown = (e) => {
       if (e.button !== 0) return
@@ -722,8 +745,8 @@ export default function TeamBattleArena({ room, players, warrior, session, onBac
           const len = Math.sqrt(dx * dx + dy * dy)
           dx /= len
           dy /= len
-          let nx = Math.max(20, Math.min(window.innerWidth - 20, cur.x + dx * speed))
-          let ny = Math.max(20, Math.min(window.innerHeight - 20, cur.y + dy * speed))
+          let nx = Math.max(20, Math.min(mapPxW - 20, cur.x + dx * speed))
+          let ny = Math.max(20, Math.min(mapPxH - 20, cur.y + dy * speed))
           const resolved = resolveWallCollision(activeMap, nx, ny, 18)
           nx = resolved.x
           ny = resolved.y
@@ -757,7 +780,7 @@ export default function TeamBattleArena({ room, players, warrior, session, onBac
       for (const p of projectilesRef.current) {
         const nx = p.x + Math.cos(p.angle) * p.speed
         const ny = p.y + Math.sin(p.angle) * p.speed
-        const inBounds = nx > 0 && nx < window.innerWidth && ny > 0 && ny < window.innerHeight
+        const inBounds = nx > 0 && nx < mapPxW && ny > 0 && ny < mapPxH
         const wallHit = inBounds && isBulletBlocked(activeMap, p.x, p.y, nx, ny).blocked
         if (wallHit) continue
 
@@ -840,9 +863,17 @@ export default function TeamBattleArena({ room, players, warrior, session, onBac
         overflow: 'hidden', userSelect: 'none', cursor: 'crosshair', zIndex: 9999,
       }}
     >
-      <div style={{ position: 'absolute', top: 0, left: 0, zIndex: 1 }}>
-        <MapRenderer map={activeMap} />
-      </div>
+      <div style={{ position: 'absolute', inset: 0, overflow: 'hidden' }}>
+        <div style={{ position: 'absolute', top: 0, left: 0, transform: `translate(${mapOffset.x}px, ${mapOffset.y}px) scale(${MAP_SCALE})`, transformOrigin: '0 0' }}>
+          <MapRenderer map={activeMap} />
+
+          {/* 地图边界：亮红色描边 */}
+          <div style={{
+            position: 'absolute', left: 0, top: 0, width: mapPxW, height: mapPxH,
+            border: '4px solid #ff2e2e',
+            boxShadow: '0 0 20px 4px rgba(255,46,46,0.6), inset 0 0 16px 4px rgba(255,46,46,0.25)',
+            pointerEvents: 'none', zIndex: 5,
+          }} />
 
       {/* Team Score 大比分（置顶居中） */}
       <div style={{
@@ -896,6 +927,7 @@ export default function TeamBattleArena({ room, players, warrior, session, onBac
       </div>
 
       {/* 我方角色 */}
+
       {me.alive && (
         <TeamFighterAvatar
           x={me.x} y={me.y} angle={me.angle} color={TEAM_INFO[myTeam].color} emoji={outfits[myWarrior.outfit] || '🧑‍⚔️'}
@@ -1007,7 +1039,11 @@ export default function TeamBattleArena({ room, players, warrior, session, onBac
         )
       })}
 
+        </div>
+      </div>
+
       {/* 战斗日志 */}
+
       <div style={{ position: 'absolute', bottom: 20, left: 20, zIndex: 100, background: 'rgba(0,0,0,0.7)', padding: 15, borderRadius: 8, color: '#fff', maxWidth: 320 }}>
         {logs.map((log, i) => <div key={i} style={{ marginBottom: 4, fontSize: 13 }}>{log}</div>)}
       </div>

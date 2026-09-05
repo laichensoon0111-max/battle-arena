@@ -95,6 +95,8 @@ export default function PvpArena({ room, players, warrior, session, onBack, map,
 
   // 没有传 map（比如离线训练/旧房间）时兜底用内置 Grassland
   const activeMap = map || room?.map_data || BUILTIN_MAPS[0]
+  const mapPxW = activeMap.width * activeMap.tileSize
+  const mapPxH = activeMap.height * activeMap.tileSize
 
   const classConfig = Classes[myWarrior.outfit] || Classes.warrior
   const enemyClassConfig = Classes[enemyWarrior.outfit] || Classes.warrior
@@ -114,8 +116,8 @@ export default function PvpArena({ room, players, warrior, session, onBack, map,
       ? { x: tileSpawn.x * activeMap.tileSize + activeMap.tileSize / 2, y: tileSpawn.y * activeMap.tileSize + activeMap.tileSize / 2 }
       : { x: fallbackX, y: fallbackY }
 
-  const startPos = spawnPx(mySpawnTile, isHost ? window.innerWidth * 0.3 : window.innerWidth * 0.7, window.innerHeight / 2)
-  const enemyStartPos = spawnPx(enemySpawnTile, isHost ? window.innerWidth * 0.7 : window.innerWidth * 0.3, window.innerHeight / 2)
+  const startPos = spawnPx(mySpawnTile, isHost ? mapPxW * 0.3 : mapPxW * 0.7, mapPxH / 2)
+  const enemyStartPos = spawnPx(enemySpawnTile, isHost ? mapPxW * 0.7 : mapPxW * 0.3, mapPxH / 2)
   const startX = startPos.x
   const startY = startPos.y
   const enemyStartX = enemyStartPos.x
@@ -136,6 +138,26 @@ export default function PvpArena({ room, players, warrior, session, onBack, map,
   const [enemySkill, setEnemySkill] = useState({ active: false, type: null })
   const [flash, setFlash] = useState(null) // { who: 'me' | 'enemy', color, until }
   const [isSprinting, setIsSprinting] = useState(false)
+
+  // 地图永远居中显示在屏幕正中间，不跟随玩家移动。
+  // 只在窗口大小变化时重新计算一次偏移量，不需要每帧更新。
+  const MAP_SCALE = 0.7 // 保持原来的整体缩放比例
+  const [mapOffset, setMapOffset] = useState({ x: 0, y: 0 })
+  const mapOffsetRef = useRef({ x: 0, y: 0 })
+
+  useEffect(() => {
+    const computeOffset = () => {
+      const offset = {
+        x: (window.innerWidth - mapPxW * MAP_SCALE) / 2,
+        y: (window.innerHeight - mapPxH * MAP_SCALE) / 2,
+      }
+      mapOffsetRef.current = offset
+      setMapOffset(offset)
+    }
+    computeOffset()
+    window.addEventListener('resize', computeOffset)
+    return () => window.removeEventListener('resize', computeOffset)
+  }, [mapPxW, mapPxH])
 
   const [gameOver, setGameOver] = useState(false)
   const [matchResult, setMatchResult] = useState(null) // 'win' | 'lose'
@@ -229,8 +251,8 @@ export default function PvpArena({ room, players, warrior, session, onBack, map,
       const newHp = Math.max(0, prev.hp - finalDamage)
       const pushX = payload.pushX || 0
       const pushY = payload.pushY || 0
-      const nextX = Math.max(20, Math.min(window.innerWidth - 20, prev.x + pushX))
-      const nextY = Math.max(20, Math.min(window.innerHeight - 20, prev.y + pushY))
+      const nextX = Math.max(20, Math.min(mapPxW - 20, prev.x + pushX))
+      const nextY = Math.max(20, Math.min(mapPxH - 20, prev.y + pushY))
 
       if (newHp === 0 && !gameOverRef.current) {
         gameOverRef.current = true
@@ -509,7 +531,10 @@ export default function PvpArena({ room, players, warrior, session, onBack, map,
   /* ---------------- 输入：鼠标（瞄准 + 开火） ---------------- */
   useEffect(() => {
     const handleMouseMove = (e) => {
-      setMe((prev) => ({ ...prev, angle: Math.atan2(e.clientY - prev.y, e.clientX - prev.x) }))
+    // 屏幕坐标 → 世界坐标：减去居中偏移、再除以缩放比例
+      const worldX = (e.clientX - mapOffsetRef.current.x) / MAP_SCALE
+      const worldY = (e.clientY - mapOffsetRef.current.y) / MAP_SCALE
+      setMe((prev) => ({ ...prev, angle: Math.atan2(worldY - prev.y, worldX - prev.x) }))
     }
     const handleMouseDown = (e) => {
       if (e.button !== 0) return
@@ -535,7 +560,7 @@ export default function PvpArena({ room, players, warrior, session, onBack, map,
   }, [performAttack, weaponConfig.mode])
 
   /* =========================================================
-     主循环：移动 / 对手插值 / 子弹移动+命中判定 / 连发 / 状态广播
+     主循环：移动 / 对手插值 / 子弹移动+命中判定 / 连发 / 摄像机 / 状态广播
   ========================================================= */
   useEffect(() => {
     if (gameOver || matchPhase !== 'fighting') return
@@ -566,8 +591,8 @@ export default function PvpArena({ room, players, warrior, session, onBack, map,
         const len = Math.sqrt(dx * dx + dy * dy)
         dx /= len
         dy /= len
-        let nx = Math.max(20, Math.min(window.innerWidth - 20, cur.x + dx * speed))
-        let ny = Math.max(20, Math.min(window.innerHeight - 20, cur.y + dy * speed))
+        let nx = Math.max(20, Math.min(mapPxW - 20, cur.x + dx * speed))
+        let ny = Math.max(20, Math.min(mapPxH - 20, cur.y + dy * speed))
         const resolved = resolveWallCollision(activeMap, nx, ny, 18)
         nx = resolved.x
         ny = resolved.y
@@ -594,7 +619,7 @@ export default function PvpArena({ room, players, warrior, session, onBack, map,
       for (const p of projectilesRef.current) {
         const nx = p.x + Math.cos(p.angle) * p.speed
         const ny = p.y + Math.sin(p.angle) * p.speed
-        const inBounds = nx > 0 && nx < window.innerWidth && ny > 0 && ny < window.innerHeight
+        const inBounds = nx > 0 && nx < mapPxW && ny > 0 && ny < mapPxH
         const wallHit = inBounds && isBulletBlocked(activeMap, p.x, p.y, nx, ny).blocked
         if (wallHit) continue // 打中墙，子弹消失，不进 remaining
 
@@ -677,9 +702,98 @@ export default function PvpArena({ room, players, warrior, session, onBack, map,
         overflow: 'hidden', userSelect: 'none', cursor: 'crosshair', zIndex: 9999,
       }}
     >
-      {/* 地图（地形 + 墙/箱子/树等物体），铺在最底层 */}
-      <div style={{ position: 'absolute', top: 0, left: 0, zIndex: 1 }}>
+       {/* 游戏世界：地图 + 角色 + 子弹等，固定居中显示，不跟随玩家移动 */}
+       <div style={{ position: 'absolute', top: 0, left: 0, transform: `translate(${mapOffset.x}px, ${mapOffset.y}px) scale(${MAP_SCALE})`, transformOrigin: '0 0', zIndex: 1 }}>
         <MapRenderer map={activeMap} />
+
+        {/* 双方角色 */}
+        <FighterAvatar x={me.x} y={me.y} angle={me.angle} color={classConfig.color} emoji={outfits[myWarrior.outfit] || '🧑‍⚔️'} isFlashing={myFlashActive} flashColor={flash?.color} />
+        {enemyVisible && (
+          <FighterAvatar x={enemy.x} y={enemy.y} angle={enemy.angle} color={enemyClassConfig.color} emoji={outfits[enemyWarrior.outfit] || '🧑‍⚔️'} isFlashing={enemyFlashActive} flashColor={flash?.color} />
+        )}
+
+        {/* 我方技能光环 */}
+        {skillActiveNow && (
+          <div style={{
+            position: 'absolute', left: me.x, top: me.y, width: 64, height: 64,
+            transform: 'translate(-50%, -50%)', borderRadius: '50%',
+            border: skillState.type === 'shield' ? '3px solid #3ea6ff' : '3px dashed #ff4d4d',
+            boxShadow: skillState.type === 'shield' ? '0 0 18px 4px rgba(62,166,255,0.7)' : '0 0 18px 4px rgba(255,77,77,0.7)',
+            pointerEvents: 'none', zIndex: 9,
+          }} />
+        )}
+
+        {/* 对方技能光环 */}
+        {enemySkill.active && enemyVisible && (
+          <div style={{
+            position: 'absolute', left: enemy.x, top: enemy.y, width: 64, height: 64,
+            transform: 'translate(-50%, -50%)', borderRadius: '50%',
+            border: enemySkill.type === 'shield' ? '3px solid #3ea6ff' : '3px dashed #ff4d4d',
+            boxShadow: enemySkill.type === 'shield' ? '0 0 18px 4px rgba(62,166,255,0.7)' : '0 0 18px 4px rgba(255,77,77,0.7)',
+            pointerEvents: 'none', zIndex: 9,
+          }} />
+        )}
+
+        {/* 我方子弹 */}
+        {projectiles.map((p) => (
+          <div key={p.id} style={{
+            position: 'absolute', left: p.x, top: p.y, width: p.size * 2, height: p.size * 2,
+            borderRadius: '50%', backgroundColor: p.color, boxShadow: `0 0 5px ${p.color}`,
+            transform: 'translate(-50%, -50%)', zIndex: 8,
+          }} />
+        ))}
+
+        {/* 对方子弹（视觉） */}
+        {incomingProjectiles.map((p) => (
+          <div key={p.id} style={{
+            position: 'absolute', left: p.x, top: p.y, width: p.size * 2, height: p.size * 2,
+            borderRadius: '50%', backgroundColor: p.color, boxShadow: `0 0 5px ${p.color}`,
+            transform: 'translate(-50%, -50%)', zIndex: 8, opacity: 0.85,
+          }} />
+        ))}
+
+        {/* 光束（狙击枪/激光枪） */}
+        {beams.filter((b) => Date.now() < b.until).map((b) => {
+          const dx = b.x2 - b.x1
+          const dy = b.y2 - b.y1
+          const length = Math.hypot(dx, dy)
+          const angle = Math.atan2(dy, dx)
+          return (
+            <div key={b.id} style={{
+              position: 'absolute', left: b.x1, top: b.y1, width: length, height: 3,
+              background: b.color, boxShadow: `0 0 8px ${b.color}`,
+              transform: `rotate(${angle}rad)`, transformOrigin: '0 50%',
+              opacity: 0.9, zIndex: 9, pointerEvents: 'none',
+            }} />
+          )
+        })}
+
+        {/* 爆炸（火箭筒溅射） */}
+        {explosions.filter((e) => Date.now() < e.until).map((e) => {
+          const progress = 1 - (e.until - Date.now()) / 400
+          const size = e.radius * 2 * (0.5 + progress * 0.6)
+          return (
+            <div key={e.id} style={{
+              position: 'absolute', left: e.x, top: e.y, width: size, height: size, borderRadius: '50%',
+              background: 'radial-gradient(circle, rgba(255,220,120,1) 0%, rgba(255,100,30,0.9) 40%, rgba(192,57,43,0) 100%)',
+              transform: 'translate(-50%, -50%)', opacity: 1 - progress, pointerEvents: 'none', zIndex: 15,
+            }} />
+          )
+        })}
+
+        {/* 伤害数字 */}
+        {damageTexts.filter((d) => Date.now() < d.until).map((d) => {
+          const progress = 1 - (d.until - Date.now()) / 800
+          return (
+            <div key={d.id} style={{
+              position: 'absolute', left: d.x, top: d.y - progress * 40, transform: 'translate(-50%, -50%)',
+              color: d.color, fontWeight: 'bold', fontSize: 18, opacity: 1 - progress,
+              textShadow: '0 0 4px rgba(0,0,0,0.8)', zIndex: 20, pointerEvents: 'none',
+            }}>
+              {d.text}
+            </div>
+          )
+        })}
       </div>
 
       {/* 我方 HUD */}
@@ -722,95 +836,6 @@ export default function PvpArena({ room, players, warrior, session, onBack, map,
           </div>
         )}
       </div>
-
-      {/* 双方角色 */}
-      <FighterAvatar x={me.x} y={me.y} angle={me.angle} color={classConfig.color} emoji={outfits[myWarrior.outfit] || '🧑‍⚔️'} isFlashing={myFlashActive} flashColor={flash?.color} />
-      {enemyVisible && (
-        <FighterAvatar x={enemy.x} y={enemy.y} angle={enemy.angle} color={enemyClassConfig.color} emoji={outfits[enemyWarrior.outfit] || '🧑‍⚔️'} isFlashing={enemyFlashActive} flashColor={flash?.color} />
-      )}
-
-      {/* 我方技能光环 */}
-      {skillActiveNow && (
-        <div style={{
-          position: 'absolute', left: me.x, top: me.y, width: 64, height: 64,
-          transform: 'translate(-50%, -50%)', borderRadius: '50%',
-          border: skillState.type === 'shield' ? '3px solid #3ea6ff' : '3px dashed #ff4d4d',
-          boxShadow: skillState.type === 'shield' ? '0 0 18px 4px rgba(62,166,255,0.7)' : '0 0 18px 4px rgba(255,77,77,0.7)',
-          pointerEvents: 'none', zIndex: 9,
-        }} />
-      )}
-
-      {/* 对方技能光环 */}
-      {enemySkill.active && enemyVisible && (
-        <div style={{
-          position: 'absolute', left: enemy.x, top: enemy.y, width: 64, height: 64,
-          transform: 'translate(-50%, -50%)', borderRadius: '50%',
-          border: enemySkill.type === 'shield' ? '3px solid #3ea6ff' : '3px dashed #ff4d4d',
-          boxShadow: enemySkill.type === 'shield' ? '0 0 18px 4px rgba(62,166,255,0.7)' : '0 0 18px 4px rgba(255,77,77,0.7)',
-          pointerEvents: 'none', zIndex: 9,
-        }} />
-      )}
-
-      {/* 我方子弹 */}
-      {projectiles.map((p) => (
-        <div key={p.id} style={{
-          position: 'absolute', left: p.x, top: p.y, width: p.size * 2, height: p.size * 2,
-          borderRadius: '50%', backgroundColor: p.color, boxShadow: `0 0 5px ${p.color}`,
-          transform: 'translate(-50%, -50%)', zIndex: 8,
-        }} />
-      ))}
-
-      {/* 对方子弹（视觉） */}
-      {incomingProjectiles.map((p) => (
-        <div key={p.id} style={{
-          position: 'absolute', left: p.x, top: p.y, width: p.size * 2, height: p.size * 2,
-          borderRadius: '50%', backgroundColor: p.color, boxShadow: `0 0 5px ${p.color}`,
-          transform: 'translate(-50%, -50%)', zIndex: 8, opacity: 0.85,
-        }} />
-      ))}
-
-      {/* 光束（狙击枪/激光枪） */}
-      {beams.filter((b) => Date.now() < b.until).map((b) => {
-        const dx = b.x2 - b.x1
-        const dy = b.y2 - b.y1
-        const length = Math.hypot(dx, dy)
-        const angle = Math.atan2(dy, dx)
-        return (
-          <div key={b.id} style={{
-            position: 'absolute', left: b.x1, top: b.y1, width: length, height: 3,
-            background: b.color, boxShadow: `0 0 8px ${b.color}`,
-            transform: `rotate(${angle}rad)`, transformOrigin: '0 50%',
-            opacity: 0.9, zIndex: 9, pointerEvents: 'none',
-          }} />
-        )
-      })}
-
-      {/* 爆炸（火箭筒溅射） */}
-      {explosions.filter((e) => Date.now() < e.until).map((e) => {
-        const progress = 1 - (e.until - Date.now()) / 400
-        const size = e.radius * 2 * (0.5 + progress * 0.6)
-        return (
-          <div key={e.id} style={{
-            position: 'absolute', left: e.x, top: e.y, width: size, height: size, borderRadius: '50%',
-            background: 'radial-gradient(circle, rgba(255,220,120,1) 0%, rgba(255,100,30,0.9) 40%, rgba(192,57,43,0) 100%)',
-            transform: 'translate(-50%, -50%)', opacity: 1 - progress, pointerEvents: 'none', zIndex: 15,
-          }} />
-        )
-      })}
-
-      {/* 伤害数字 */}
-      {damageTexts.filter((d) => Date.now() < d.until).map((d) => {
-        const progress = 1 - (d.until - Date.now()) / 800
-        return (
-          <div key={d.id} style={{
-            position: 'absolute', left: d.x, top: d.y - progress * 40, transform: 'translate(-50%, -50%)',
-            color: d.color, fontWeight: 'bold', fontSize: 18, opacity: 1 - progress,
-            textShadow: '0 0 4px rgba(0,0,0,0.8)', zIndex: 20, pointerEvents: 'none',
-          }}>
-            {d.text}
-          </div>
-        )
-      })}
 
       {/* 战斗日志 */}
       <div style={{ position: 'absolute', bottom: 20, left: 20, zIndex: 100, background: 'rgba(0,0,0,0.7)', padding: 15, borderRadius: 8, color: '#fff', maxWidth: 320 }}>

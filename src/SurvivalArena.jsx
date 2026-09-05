@@ -6,54 +6,6 @@ import MapRenderer from './MapRenderer'
 import { canSeeEnemy, markShooterRevealed, shapeOutgoingVisibility } from './useMapVisibility'
 import MatchCountdown from './MatchCountdown'
 
-/* =====================================================
-   SURVIVAL（最多 4 人合作，无限刷怪，能活多久算多久）
-   ─────────────────────────────────────────────────────
-   玩家侧的移动/瞄准/开火/技能/倒地/救援跟 BossRaidArena 是
-   同一套逻辑。跟 Boss Raid 的核心区别：
-
-   - Boss Raid = 打一只 Boss，打死了就结束
-   - Survival  = 没有"打死了就结束"，敌人一波接一波，
-                 越往后越难，直到全队倒地才结束
-
-   敌人是 NPC，没有自己的客户端，所以由"当前权威"（见下面
-   ★ HOST FAILOVER）的客户端本地权威运行"Wave 导演"：
-   决定这一波刷什么怪、怪的属性、AI 移动/攻击，然后把结果
-   广播给其他人。任何玩家打中敌人都广播 'enemyHit'，只有
-   权威端的监听器真正扣血、判定死亡、掉落、开下一波。
-
-   在题目要求之上加了两个让 Survival 更好玩的小设计：
-   1. 💊 Health Orb：击杀有几率掉落治疗球，谁走过去谁回血，
-      逼玩家在苟命和贪血之间做选择，而不是纯站桩输出。
-   2. ⏸️ Wave 间的喘息时间：清光一波后有 5 秒缓冲，横幅提示
-      下一波会出现什么类型的敌人（"⚠️ Ranged incoming"之类），
-      让玩家有时间集合/走位而不是无缝地狱模式，同时缓冲期间
-      全队会缓慢回血，奖励打得干净的队伍。
-
-   ★ FIX (全队倒地判定同步问题)：
-   以前每个客户端各自独立跑 checkAllDowned()，容易出现
-   "我这边先判定全灭黑屏结算，队友那边还在打"的不同步情况，
-   revive 也可能因为本地 matchEndedRef 提前变 true 而失效。
-   现在改成只有权威端判断，判断完广播 'matchEnded'，所有客户端
-   收到广播后统一切换到 'ended'，避免分裂状态。
-
-   ★ HOST FAILOVER (房主崩溃/掉线后的权威转移)：
-   以前"谁是权威"完全焊死在 room.host_id 上——如果创建房间
-   的那个人中途崩溃（浏览器扩展冲突、断网、关标签页），
-   Wave 导演和敌人 AI 会跟着他的客户端一起停止运行，队友那边
-   会变成"敌人卡在原地不动"，永远卡死，没有任何恢复手段。
-
-   现在改用 Supabase Presence：所有玩家都往频道里 track 自己的
-   user_id，谁是"当前有效权威"(isEffectiveHost) 不再固定看
-   room.host_id，而是看当前还在线的玩家里 user_id 排序最小的
-   那个人。一旦原本的权威掉线/崩溃，他的 presence 会自动消失，
-   剩下的人立刻会选出新的权威接管，继续跑 Wave 导演。
-   新权威本地没有旧权威内存里的敌人坐标（那些数据只活在旧权威
-   的浏览器里），所以接管时会把当前这一波强制重置为
-   'spawning'，为这一波重新刷怪——代价是这一波的敌人会重置，
-   但换来的是游戏能继续玩下去，而不是永久卡死。
-===================================================== */
-
 const STATE_BROADCAST_MS = 70
 const ENEMY_BROADCAST_MS = 120
 const SPRINT_DURATION_MS = 500
@@ -64,14 +16,12 @@ const ENEMY_LERP = 0.2
 const REVIVE_RANGE = 70
 const REVIVE_HOLD_MS = 3000
 const REVIVE_HP_RATIO = 0.5
-// 没有 BLEED_OUT_MS：Survival 里倒地可以一直等队友救，
-// 只有"全队同时倒地"才会结束（跟题目里的死亡规则一致）
 
 const WAVE_BREATHER_MS = 5000
 const ORB_DROP_CHANCE = 0.18
 const ORB_HEAL_RATIO = 0.35
 const ORB_PICKUP_RADIUS = 30
-const BREATHER_HEAL_PER_TICK = 4 // 喘息期间每 300ms 回一点血
+const BREATHER_HEAL_PER_TICK = 4
 
 const ENEMY_TYPES = {
   normal: { emoji: '👹', hpMult: 1, speedMult: 1, dmgMult: 1, range: 42, color: '#c0392b' },
@@ -110,7 +60,6 @@ function spawnFor(map, idx) {
   return { x: tile.x * ts + ts / 2 + Math.cos(angle) * jitter, y: tile.y * ts + ts / 2 + Math.sin(angle) * jitter }
 }
 
-/* 每一波的基础属性（还没乘类型系数），随 wave 线性变难 */
 function baseStatsForWave(wave) {
   return {
     hp: 40 + wave * 14,
@@ -121,7 +70,6 @@ function baseStatsForWave(wave) {
 
 function isBossWave(wave) { return wave % 5 === 0 }
 
-/* 每 5 波一个更强的 Boss 梯队：Wave5=BOSS，Wave10=BIG BOSS，Wave15+=BOSS+ */
 function bossTier(wave) {
   const tierIndex = Math.floor(wave / 5)
   const label = tierIndex === 1 ? 'BOSS' : tierIndex === 2 ? 'BIG BOSS' : 'BOSS+'
@@ -160,14 +108,12 @@ function makeEnemy(type, wave, x, y, overrides = {}) {
   }
 }
 
-/* 生成这一波的敌人列表：Boss 波只有一只强化 Boss（+ 少量小怪），
-   普通波按 spec 里的数量曲线 (3, 5, 8, 10...) 混合类型 */
 function buildWaveEnemies(wave, map, spawnPoint) {
   if (isBossWave(wave)) {
     const tier = bossTier(wave)
     const boss = makeEnemy('normal', wave, spawnPoint.x, spawnPoint.y, {
       isBoss: true, tierLabel: tier.label,
-      hp: undefined, maxHp: undefined, // 下面手动覆盖，boss 血量比小怪高一个数量级
+      hp: undefined, maxHp: undefined,
     })
     const base = baseStatsForWave(wave)
     boss.hp = Math.round(base.hp * 13 * tier.mult)
@@ -195,7 +141,6 @@ function buildWaveEnemies(wave, map, spawnPoint) {
   return list
 }
 
-/* 挑一个离所有存活玩家都比较远的刷怪点，避免刚出怪就贴脸 */
 function pickSpawnPoint(map, targets) {
   let best = null
   let bestScore = -1
@@ -218,9 +163,6 @@ function formatClock(ms) {
   return String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0')
 }
 
-/* =====================================================
-   小组件
-===================================================== */
 function CoopFighterAvatar({ x, y, angle, color, emoji, isSelf, downed, isFlashing, flashColor }) {
   return (
     <div
@@ -264,19 +206,32 @@ function EnemyAvatar({ enemy }) {
   )
 }
 
-/* =====================================================
-   Survival 核心组件
-===================================================== */
 export default function SurvivalArena({ room, players, warrior, session, onBack, map, onMatchEnd }) {
   const myId = session.user.id
-  // 注意：这里特意用数据库里真正的 room.host_id，而不是下面
-  // Presence 选出来的 isEffectiveHost —— App.jsx 的 returnToLobby()
-  // 权限判断认的是真正房主，两边要对得上，不然 failover 后新指挥官
-  // 点了按钮也会被 Supabase 静默拒绝。
   const isRealHost = room?.host_id === myId
   const activeMap = map || room?.map_data || BUILTIN_MAPS[0]
+  const mapPxW = activeMap.width * activeMap.tileSize
+  const mapPxH = activeMap.height * activeMap.tileSize
   const orderedPlayers = players
   const myIndex = Math.max(0, orderedPlayers.findIndex((p) => p.user_id === myId))
+
+  const MAP_SCALE = 0.7
+  const [mapOffset, setMapOffset] = useState({ x: 0, y: 0 })
+  const mapOffsetRef = useRef({ x: 0, y: 0 })
+
+  useEffect(() => {
+    const computeOffset = () => {
+      const offset = {
+        x: (window.innerWidth - mapPxW * MAP_SCALE) / 2,
+        y: (window.innerHeight - mapPxH * MAP_SCALE) / 2,
+      }
+      mapOffsetRef.current = offset
+      setMapOffset(offset)
+    }
+    computeOffset()
+    window.addEventListener('resize', computeOffset)
+    return () => window.removeEventListener('resize', computeOffset)
+  }, [mapPxW, mapPxH])
 
   const myWarrior = warrior
   const classConfig = Classes[myWarrior.outfit] || Classes.warrior
@@ -323,7 +278,7 @@ export default function SurvivalArena({ room, players, warrior, session, onBack,
   const [wave, setWave] = useState(1)
   const waveRef = useRef(1)
   useEffect(() => { waveRef.current = wave }, [wave])
-  const [waveStatus, setWaveStatus] = useState('spawning') // 'spawning' | 'active' | 'breather'
+  const [waveStatus, setWaveStatus] = useState('spawning')
   const waveStatusRef = useRef('spawning')
   useEffect(() => { waveStatusRef.current = waveStatus }, [waveStatus])
   const [totalKills, setTotalKills] = useState(0)
@@ -340,12 +295,6 @@ export default function SurvivalArena({ room, players, warrior, session, onBack,
   const [beams, setBeams] = useState([])
   const [explosions, setExplosions] = useState([])
   const [damageTexts, setDamageTexts] = useState([])
-  // ★ FIX：日志列表以前用数组下标当 key，且是往最前面插入新项——
-  // React 会把这当成"第0项内容变了"而不是"新增了一项"，于是原地
-  // 更新已有 DOM 节点。如果浏览器扩展（翻译/朗读类插件）已经在这些
-  // 节点里插入了它自己的包装元素，"原地更新" 就会跟扩展的假设打架，
-  // 触发 insertBefore 崩溃。改成每条日志都有一个永久不变的 id 当 key，
-  // 插入新日志时 React 就能正确识别成"新增节点"而不是"覆写旧节点"。
   const logIdRef = useRef(1)
   const [logs, setLogs] = useState([{ id: 0, text: '💀 Survival — Wave 1 incoming!' }])
 
@@ -355,7 +304,7 @@ export default function SurvivalArena({ room, players, warrior, session, onBack,
   const [isSprinting, setIsSprinting] = useState(false)
   const [reviveProgress, setReviveProgress] = useState(null)
 
-  const [matchPhase, setMatchPhase] = useState('countdown') // countdown -> fighting -> ended
+  const [matchPhase, setMatchPhase] = useState('countdown')
   const matchPhaseRef = useRef('countdown')
   useEffect(() => { matchPhaseRef.current = matchPhase }, [matchPhase])
   const matchEndedRef = useRef(false)
@@ -365,18 +314,12 @@ export default function SurvivalArena({ room, players, warrior, session, onBack,
   const revealUntilRef = useRef(0)
   const [myConcealed, setMyConcealed] = useState(false)
 
-  /* =========================================================
-     ★ HOST FAILOVER：谁是"当前有效权威"由 Presence 在线名单决定，
-     不再固定看 room.host_id。初始值先用 room.host_id 兜底，
-     等 Presence 第一次 sync 之后会被覆盖成真实的在线判定结果。
-  ========================================================= */
   const [effectiveHostId, setEffectiveHostId] = useState(room?.host_id)
   const effectiveHostIdRef = useRef(room?.host_id)
   const isEffectiveHost = effectiveHostId === myId
   const isEffectiveHostRef = useRef(isEffectiveHost)
   useEffect(() => { isEffectiveHostRef.current = isEffectiveHost }, [isEffectiveHost])
 
-  /* ---------------- refs ---------------- */
   const meRef = useRef(me)
   const othersRef = useRef(others)
   const projectilesRef = useRef(projectiles)
@@ -433,12 +376,6 @@ export default function SurvivalArena({ room, players, warrior, session, onBack,
     })
   }, [broadcast, activeMap])
 
-  /* =========================================================
-     全队同时倒地 → GAME OVER
-     ★ FIX：只由当前有效权威判断并广播 'matchEnded'，其他客户端
-     统一在下面的频道监听里跟随切换，避免各端各自判断导致的
-     "我这边先黑屏，队友那边还在打"的不同步问题。
-  ========================================================= */
   const checkAllDowned = useCallback(() => {
     if (matchEndedRef.current || !isEffectiveHostRef.current) return
     const allDowned = orderedPlayers.every((p) => {
@@ -453,9 +390,6 @@ export default function SurvivalArena({ room, players, warrior, session, onBack,
     }
   }, [orderedPlayers, myId, addLog, broadcast])
 
-  /* =========================================================
-     承受伤害（来自敌人）
-  ========================================================= */
   const applyIncomingHit = useCallback((payload) => {
     if (matchEndedRef.current || meRef.current.downed) return
     const now = Date.now()
@@ -477,8 +411,8 @@ export default function SurvivalArena({ room, players, warrior, session, onBack,
       const newHp = Math.max(0, prev.hp - finalDamage)
       const pushX = payload.pushX || 0
       const pushY = payload.pushY || 0
-      const nextX = Math.max(20, Math.min(window.innerWidth - 20, prev.x + pushX))
-      const nextY = Math.max(20, Math.min(window.innerHeight - 20, prev.y + pushY))
+      const nextX = Math.max(20, Math.min(mapPxW - 20, prev.x + pushX))
+      const nextY = Math.max(20, Math.min(mapPxH - 20, prev.y + pushY))
       if (newHp === 0 && !prev.downed) {
         addLog('🩸 你被打倒了！按住 F 让队友救你')
         return { ...prev, hp: 0, x: nextX, y: nextY, downed: true }
@@ -504,8 +438,6 @@ export default function SurvivalArena({ room, players, warrior, session, onBack,
     else broadcast('hit', { targetId, damage, pushX, pushY })
   }, [myId, applyIncomingHit, broadcast])
 
-  /* 拾取治疗球：本地直接回自己的血（自己一直是自己 HP 的权威），
-     然后广播一下让大家把这颗球从画面上摘掉，避免被重复拾取 */
   const tryPickupOrbs = useCallback(() => {
     if (meRef.current.downed) return
     const cur = meRef.current
@@ -524,9 +456,6 @@ export default function SurvivalArena({ room, players, warrior, session, onBack,
     }
   }, [addDamageText, addLog, broadcast, broadcastOwnState])
 
-  /* =========================================================
-     Realtime 频道 + Presence（★ HOST FAILOVER 的核心）
-  ========================================================= */
   useEffect(() => {
     const channel = supabase.channel('pvp-arena-' + room.id, {
       config: { broadcast: { self: false }, presence: { key: myId } },
@@ -581,7 +510,6 @@ export default function SurvivalArena({ room, players, warrior, session, onBack,
         setOrbs((prev) => prev.filter((o) => o.id !== payload.orbId))
       })
       .on('broadcast', { event: 'matchEnded' }, () => {
-        // ★ FIX：权威端判定全队倒地后广播到这里，所有客户端统一切到 'ended'
         if (!matchEndedRef.current) {
           matchEndedRef.current = true
           setMatchPhase('ended')
@@ -589,8 +517,6 @@ export default function SurvivalArena({ room, players, warrior, session, onBack,
         }
       })
       .on('broadcast', { event: 'restart' }, () => resetMatchRef.current())
-      // ★ HOST FAILOVER：在线名单一变（有人加入/掉线/崩溃），
-      // 就重新算一次"谁是权威"——当前在线玩家里 user_id 排序最小的那个人。
       .on('presence', { event: 'sync' }, () => {
         const state = channel.presenceState()
         const ids = Object.values(state)
@@ -616,11 +542,6 @@ export default function SurvivalArena({ room, players, warrior, session, onBack,
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [room.id, applyIncomingHit, applyRevive, myId])
 
-  /* =========================================================
-     ★ HOST FAILOVER：我刚从"非权威"变成"权威"（原权威掉线/崩溃，
-     轮到我接管）。本地没有旧权威内存里那份敌人坐标，所以把
-     当前这一波强制重置为 'spawning'，为这一波重新刷怪。
-  ========================================================= */
   const wasEffectiveHostRef = useRef(isEffectiveHost)
   useEffect(() => {
     const justTookOver = isEffectiveHost && !wasEffectiveHostRef.current
@@ -638,9 +559,6 @@ export default function SurvivalArena({ room, players, warrior, session, onBack,
     }
   }, [isEffectiveHost, addLog])
 
-  /* =========================================================
-     玩家打敌人（子弹/光束命中判定跟其它模式一样，目标换成敌人数组）
-  ========================================================= */
   const hostApplyEnemyDamageRef = useRef(() => {})
 
   const damageEnemy = useCallback((enemyId, amount) => {
@@ -723,9 +641,6 @@ export default function SurvivalArena({ room, players, warrior, session, onBack,
     setTimeout(() => broadcast('skill', { active: false }), skillConfig.durationMs)
   }, [skillConfig, addLog, broadcast])
 
-  /* =========================================================
-     重开一局
-  ========================================================= */
   const resetMatch = useCallback(() => {
     const pos = spawnFor(activeMap, myIndex)
     setMe({ x: pos.x, y: pos.y, angle: 0, hp: classConfig.hp, maxHp: classConfig.hp, downed: false })
@@ -775,9 +690,6 @@ export default function SurvivalArena({ room, players, warrior, session, onBack,
     broadcast('restart', {})
   }, [resetMatch, broadcast])
 
-  /* =========================================================
-     输入
-  ========================================================= */
   useEffect(() => {
     const handleKeyDown = (e) => {
       if (matchPhaseRef.current !== 'fighting') return
@@ -810,7 +722,9 @@ export default function SurvivalArena({ room, players, warrior, session, onBack,
   useEffect(() => {
     const handleMouseMove = (e) => {
       if (meRef.current.downed) return
-      setMe((prev) => ({ ...prev, angle: Math.atan2(e.clientY - prev.y, e.clientX - prev.x) }))
+      const worldX = (e.clientX - mapOffsetRef.current.x) / MAP_SCALE
+      const worldY = (e.clientY - mapOffsetRef.current.y) / MAP_SCALE
+      setMe((prev) => ({ ...prev, angle: Math.atan2(worldY - prev.y, worldX - prev.x) }))
     }
     const handleMouseDown = (e) => {
       if (e.button !== 0) return
@@ -832,9 +746,6 @@ export default function SurvivalArena({ room, players, warrior, session, onBack,
     }
   }, [performAttack, weaponConfig.mode])
 
-  /* =========================================================
-     主循环（玩家侧，所有客户端都跑）
-  ========================================================= */
   useEffect(() => {
     if (matchPhase !== 'fighting') return
 
@@ -861,8 +772,8 @@ export default function SurvivalArena({ room, players, warrior, session, onBack,
           const len = Math.sqrt(dx * dx + dy * dy)
           dx /= len
           dy /= len
-          let nx = Math.max(20, Math.min(window.innerWidth - 20, cur.x + dx * speed))
-          let ny = Math.max(20, Math.min(window.innerHeight - 20, cur.y + dy * speed))
+          let nx = Math.max(20, Math.min(mapPxW - 20, cur.x + dx * speed))
+          let ny = Math.max(20, Math.min(mapPxH - 20, cur.y + dy * speed))          
           const resolved = resolveWallCollision(activeMap, nx, ny, 18)
           nx = resolved.x
           ny = resolved.y
@@ -893,12 +804,11 @@ export default function SurvivalArena({ room, players, warrior, session, onBack,
         }))
       }
 
-      // 我方子弹移动 + 命中判定 —— 先结算旧子弹
       const remaining = []
       for (const p of projectilesRef.current) {
         const nx = p.x + Math.cos(p.angle) * p.speed
         const ny = p.y + Math.sin(p.angle) * p.speed
-        const inBounds = nx > 0 && nx < window.innerWidth && ny > 0 && ny < window.innerHeight
+        const inBounds = nx > 0 && nx < mapPxW && ny > 0 && ny < mapPxH
         const wallHit = inBounds && isBulletBlocked(activeMap, p.x, p.y, nx, ny).blocked
         if (wallHit) continue
 
@@ -920,7 +830,6 @@ export default function SurvivalArena({ room, players, warrior, session, onBack,
       }
       setProjectiles(remaining)
 
-      // 连发武器 —— 放在旧子弹结算之后再追加新子弹
       if (canAct && currentWeapon.mode === 'auto' && mouseDown.current && !matchEndedRef.current) {
         const interval = currentWeapon.cooldown * (currentClass.attackSpeedMultiplier || 1)
         if (now - lastAutoFireAt.current >= interval) {
@@ -959,7 +868,6 @@ export default function SurvivalArena({ room, players, warrior, session, onBack,
         setReviveProgress(null)
       }
 
-      // 喘息期间全队缓慢回血
       if (waveDirectorRef.current.status === 'breather' && canAct && now - lastBreatherHealAt.current > 300) {
         lastBreatherHealAt.current = now
         setMe((prev) => (prev.hp < prev.maxHp ? { ...prev, hp: Math.min(prev.maxHp, prev.hp + BREATHER_HEAL_PER_TICK) } : prev))
@@ -983,9 +891,6 @@ export default function SurvivalArena({ room, players, warrior, session, onBack,
     return () => cancelAnimationFrame(animationFrameRef.current)
   }, [matchPhase, spawnProjectile, damageEnemy, addDamageText, broadcast, activeMap, myId, orderedPlayers, checkAllDowned, reviveProgress, tryPickupOrbs])
 
-  /* =========================================================
-     Wave 导演 + 敌人 AI：只有"当前有效权威"的客户端跑
-  ========================================================= */
   useEffect(() => {
     if (!isEffectiveHost || matchPhase !== 'fighting') return
     survivalStartRef.current = survivalStartRef.current || Date.now()
@@ -1022,7 +927,6 @@ export default function SurvivalArena({ room, players, warrior, session, onBack,
         if (f && !f.downed) targets.push({ id: p.user_id, x: f.x, y: f.y })
       })
 
-      // 敌人 AI：追击 + 攻击
       let changed = false
       const nextEnemies = enemiesRef.current.map((e) => {
         if (targets.length === 0) return e
@@ -1035,7 +939,6 @@ export default function SurvivalArena({ room, players, warrior, session, onBack,
         let ny = e.y
 
         if (def.attackRange) {
-          // Ranged：保持距离，太近就后退，太远就靠近
           const desired = def.attackRange * 0.65
           if (nearestDist < desired - 30) {
             const dx = e.x - nearest.x
@@ -1076,7 +979,6 @@ export default function SurvivalArena({ room, players, warrior, session, onBack,
       enemiesRef.current = nextEnemies
       if (changed) setEnemies([...nextEnemies])
 
-      // Wave 导演状态机
       if (director.status === 'spawning') {
         const spawnPoint = pickSpawnPoint(activeMap, targets)
         const list = buildWaveEnemies(director.wave, activeMap, spawnPoint)
@@ -1121,13 +1023,6 @@ export default function SurvivalArena({ room, players, warrior, session, onBack,
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isEffectiveHost, matchPhase, orderedPlayers, myId, broadcast, addLog, hitPlayer, activeMap])
 
-  // wave/waveStatus/breatherUntil 的 React state 只在权威端的
-  // Wave 导演状态机真正切换阶段时才更新（见上面 loop 内的三个分支），
-  // 不是每帧都 setState，避免不必要的重渲染。
-
-  /* =========================================================
-     渲染
-  ========================================================= */
   const myFlashActive = flash?.who === 'me' && Date.now() < flash.until
   const skillReady = skillConfig && Date.now() >= skillCooldownUntil
   const skillActiveNow = skillState.active && Date.now() < skillState.until
@@ -1140,13 +1035,79 @@ export default function SurvivalArena({ room, players, warrior, session, onBack,
       style={{
         position: 'fixed', top: 0, left: 0, width: '100vw', height: '100vh',
         backgroundColor: '#0a0a0c',
-        backgroundImage: 'linear-gradient(rgba(255,255,255,0.03) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.03) 1px, transparent 1px)',
-        backgroundSize: '50px 50px',
         overflow: 'hidden', userSelect: 'none', cursor: 'crosshair', zIndex: 9999,
       }}
     >
-      <div style={{ position: 'absolute', top: 0, left: 0, zIndex: 1 }}>
-        <MapRenderer map={activeMap} />
+      {/* 摄像机 viewport：地图 + 所有世界坐标物体在同一层，固定居中显示 */}
+      <div style={{ position: 'absolute', inset: 0, overflow: 'hidden' }}>
+        <div style={{ position: 'absolute', top: 0, left: 0, transform: `translate(${mapOffset.x}px, ${mapOffset.y}px) scale(${MAP_SCALE})`, transformOrigin: '0 0' }}>
+          <MapRenderer map={activeMap} />
+
+          {/* 地图边界：亮红色描边 */}
+          <div style={{
+            position: 'absolute', left: 0, top: 0, width: mapPxW, height: mapPxH,
+            border: '4px solid #ff2e2e',
+            boxShadow: '0 0 20px 4px rgba(255,46,46,0.6), inset 0 0 16px 4px rgba(255,46,46,0.25)',
+            pointerEvents: 'none', zIndex: 5,
+          }} />
+
+          {/* 治疗球 */}
+          {orbs.map((o) => (
+            <div key={o.id} style={{
+              position: 'absolute', left: o.x, top: o.y, width: 22, height: 22, transform: 'translate(-50%, -50%)',
+              borderRadius: '50%', background: 'radial-gradient(circle, #7CFC00 0%, #2ecc71 60%, rgba(46,204,113,0) 100%)',
+              boxShadow: '0 0 12px 4px rgba(46,204,113,0.7)', zIndex: 7,
+            }} />
+          ))}
+
+          {/* 敌人 */}
+          {enemies.map((e) => <EnemyAvatar key={e.id} enemy={e} />)}
+
+          {/* 我方角色 */}
+          <CoopFighterAvatar x={me.x} y={me.y} angle={me.angle} color={classConfig.color} emoji={outfits[myWarrior.outfit] || '🧑‍⚔️'} isSelf downed={me.downed} isFlashing={myFlashActive} flashColor={flash?.color} />
+
+          {/* 队友 */}
+          {Object.values(others).map((f) => {
+            const otherWarrior = f.warrior || {}
+            const otherClass = Classes[otherWarrior.outfit] || Classes.warrior
+            return <CoopFighterAvatar key={f.id} x={f.x} y={f.y} angle={f.angle} color={otherClass.color} emoji={outfits[otherWarrior.outfit] || '🧑‍⚔️'} isSelf={false} downed={f.downed} isFlashing={false} />
+          })}
+
+          {skillActiveNow && (
+            <div style={{ position: 'absolute', left: me.x, top: me.y, width: 64, height: 64, transform: 'translate(-50%, -50%)', borderRadius: '50%', border: skillState.type === 'shield' ? '3px solid #3ea6ff' : '3px dashed #ff4d4d', boxShadow: skillState.type === 'shield' ? '0 0 18px 4px rgba(62,166,255,0.7)' : '0 0 18px 4px rgba(255,77,77,0.7)', pointerEvents: 'none', zIndex: 9 }} />
+          )}
+
+          {reviveProgress && others[reviveProgress.targetId] && (
+            <div style={{ position: 'absolute', left: others[reviveProgress.targetId].x, top: others[reviveProgress.targetId].y - 40, transform: 'translate(-50%, -50%)', width: 80, zIndex: 20, pointerEvents: 'none' }}>
+              <div style={{ fontSize: 10, color: '#fff', textAlign: 'center', marginBottom: 2, textShadow: '0 0 3px #000' }}>REVIVING…</div>
+              <div style={{ width: '100%', height: 6, background: '#333', borderRadius: 3, overflow: 'hidden' }}>
+                <div style={{ width: (reviveProgress.progress * 100) + '%', height: '100%', background: '#2ecc71' }} />
+              </div>
+            </div>
+          )}
+
+          {projectiles.map((p) => <div key={p.id} style={{ position: 'absolute', left: p.x, top: p.y, width: p.size * 2, height: p.size * 2, borderRadius: '50%', backgroundColor: p.color, boxShadow: `0 0 5px ${p.color}`, transform: 'translate(-50%, -50%)', zIndex: 8 }} />)}
+          {incomingProjectiles.map((p) => <div key={p.id} style={{ position: 'absolute', left: p.x, top: p.y, width: p.size * 2, height: p.size * 2, borderRadius: '50%', backgroundColor: p.color, boxShadow: `0 0 5px ${p.color}`, transform: 'translate(-50%, -50%)', zIndex: 8, opacity: 0.85 }} />)}
+
+          {beams.filter((b) => Date.now() < b.until).map((b) => {
+            const dx = b.x2 - b.x1
+            const dy = b.y2 - b.y1
+            const length = Math.hypot(dx, dy)
+            const angle = Math.atan2(dy, dx)
+            return <div key={b.id} style={{ position: 'absolute', left: b.x1, top: b.y1, width: length, height: 3, background: b.color, boxShadow: `0 0 8px ${b.color}`, transform: `rotate(${angle}rad)`, transformOrigin: '0 50%', opacity: 0.9, zIndex: 9, pointerEvents: 'none' }} />
+          })}
+
+          {explosions.filter((e) => Date.now() < e.until).map((e) => {
+            const progress = 1 - (e.until - Date.now()) / 400
+            const size = e.radius * 2 * (0.5 + progress * 0.6)
+            return <div key={e.id} style={{ position: 'absolute', left: e.x, top: e.y, width: size, height: size, borderRadius: '50%', background: 'radial-gradient(circle, rgba(255,220,120,1) 0%, rgba(255,100,30,0.9) 40%, rgba(192,57,43,0) 100%)', transform: 'translate(-50%, -50%)', opacity: 1 - progress, pointerEvents: 'none', zIndex: 15 }} />
+          })}
+
+          {damageTexts.filter((d) => Date.now() < d.until).map((d) => {
+            const progress = 1 - (d.until - Date.now()) / 800
+            return <div key={d.id} style={{ position: 'absolute', left: d.x, top: d.y - progress * 40, transform: 'translate(-50%, -50%)', color: d.color, fontWeight: 'bold', fontSize: 18, opacity: 1 - progress, textShadow: '0 0 4px rgba(0,0,0,0.8)', zIndex: 20, pointerEvents: 'none' }}>{d.text}</div>
+          })}
+        </div>
       </div>
 
       {/* Wave / 计时 / 击杀 状态条 */}
@@ -1195,63 +1156,7 @@ export default function SurvivalArena({ room, players, warrior, session, onBack,
         })}
       </div>
 
-      {/* 治疗球 */}
-      {orbs.map((o) => (
-        <div key={o.id} style={{
-          position: 'absolute', left: o.x, top: o.y, width: 22, height: 22, transform: 'translate(-50%, -50%)',
-          borderRadius: '50%', background: 'radial-gradient(circle, #7CFC00 0%, #2ecc71 60%, rgba(46,204,113,0) 100%)',
-          boxShadow: '0 0 12px 4px rgba(46,204,113,0.7)', zIndex: 7,
-        }} />
-      ))}
-
-      {/* 敌人 */}
-      {enemies.map((e) => <EnemyAvatar key={e.id} enemy={e} />)}
-
-      {/* 我方角色 */}
-      <CoopFighterAvatar x={me.x} y={me.y} angle={me.angle} color={classConfig.color} emoji={outfits[myWarrior.outfit] || '🧑‍⚔️'} isSelf downed={me.downed} isFlashing={myFlashActive} flashColor={flash?.color} />
-
-      {/* 队友 */}
-      {Object.values(others).map((f) => {
-        const otherWarrior = f.warrior || {}
-        const otherClass = Classes[otherWarrior.outfit] || Classes.warrior
-        return <CoopFighterAvatar key={f.id} x={f.x} y={f.y} angle={f.angle} color={otherClass.color} emoji={outfits[otherWarrior.outfit] || '🧑‍⚔️'} isSelf={false} downed={f.downed} isFlashing={false} />
-      })}
-
-      {skillActiveNow && (
-        <div style={{ position: 'absolute', left: me.x, top: me.y, width: 64, height: 64, transform: 'translate(-50%, -50%)', borderRadius: '50%', border: skillState.type === 'shield' ? '3px solid #3ea6ff' : '3px dashed #ff4d4d', boxShadow: skillState.type === 'shield' ? '0 0 18px 4px rgba(62,166,255,0.7)' : '0 0 18px 4px rgba(255,77,77,0.7)', pointerEvents: 'none', zIndex: 9 }} />
-      )}
-
-      {reviveProgress && others[reviveProgress.targetId] && (
-        <div style={{ position: 'absolute', left: others[reviveProgress.targetId].x, top: others[reviveProgress.targetId].y - 40, transform: 'translate(-50%, -50%)', width: 80, zIndex: 20, pointerEvents: 'none' }}>
-          <div style={{ fontSize: 10, color: '#fff', textAlign: 'center', marginBottom: 2, textShadow: '0 0 3px #000' }}>REVIVING…</div>
-          <div style={{ width: '100%', height: 6, background: '#333', borderRadius: 3, overflow: 'hidden' }}>
-            <div style={{ width: (reviveProgress.progress * 100) + '%', height: '100%', background: '#2ecc71' }} />
-          </div>
-        </div>
-      )}
-
-      {projectiles.map((p) => <div key={p.id} style={{ position: 'absolute', left: p.x, top: p.y, width: p.size * 2, height: p.size * 2, borderRadius: '50%', backgroundColor: p.color, boxShadow: `0 0 5px ${p.color}`, transform: 'translate(-50%, -50%)', zIndex: 8 }} />)}
-      {incomingProjectiles.map((p) => <div key={p.id} style={{ position: 'absolute', left: p.x, top: p.y, width: p.size * 2, height: p.size * 2, borderRadius: '50%', backgroundColor: p.color, boxShadow: `0 0 5px ${p.color}`, transform: 'translate(-50%, -50%)', zIndex: 8, opacity: 0.85 }} />)}
-
-      {beams.filter((b) => Date.now() < b.until).map((b) => {
-        const dx = b.x2 - b.x1
-        const dy = b.y2 - b.y1
-        const length = Math.hypot(dx, dy)
-        const angle = Math.atan2(dy, dx)
-        return <div key={b.id} style={{ position: 'absolute', left: b.x1, top: b.y1, width: length, height: 3, background: b.color, boxShadow: `0 0 8px ${b.color}`, transform: `rotate(${angle}rad)`, transformOrigin: '0 50%', opacity: 0.9, zIndex: 9, pointerEvents: 'none' }} />
-      })}
-
-      {explosions.filter((e) => Date.now() < e.until).map((e) => {
-        const progress = 1 - (e.until - Date.now()) / 400
-        const size = e.radius * 2 * (0.5 + progress * 0.6)
-        return <div key={e.id} style={{ position: 'absolute', left: e.x, top: e.y, width: size, height: size, borderRadius: '50%', background: 'radial-gradient(circle, rgba(255,220,120,1) 0%, rgba(255,100,30,0.9) 40%, rgba(192,57,43,0) 100%)', transform: 'translate(-50%, -50%)', opacity: 1 - progress, pointerEvents: 'none', zIndex: 15 }} />
-      })}
-
-      {damageTexts.filter((d) => Date.now() < d.until).map((d) => {
-        const progress = 1 - (d.until - Date.now()) / 800
-        return <div key={d.id} style={{ position: 'absolute', left: d.x, top: d.y - progress * 40, transform: 'translate(-50%, -50%)', color: d.color, fontWeight: 'bold', fontSize: 18, opacity: 1 - progress, textShadow: '0 0 4px rgba(0,0,0,0.8)', zIndex: 20, pointerEvents: 'none' }}>{d.text}</div>
-      })}
-
+      {/* 战斗日志 */}
       <div style={{ position: 'absolute', bottom: 20, left: 20, zIndex: 100, background: 'rgba(0,0,0,0.7)', padding: 15, borderRadius: 8, color: '#fff', maxWidth: 320 }}>
         {logs.map((log) => <div key={log.id} style={{ marginBottom: 4, fontSize: 13 }}>{log.text}</div>)}
       </div>

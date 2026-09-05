@@ -6,32 +6,6 @@ import MapRenderer from './MapRenderer'
 import { canSeeEnemy, markShooterRevealed, shapeOutgoingVisibility } from './useMapVisibility'
 import MatchCountdown from './MatchCountdown'
 
-/* =====================================================
-   BOSS RAID（最多 4 人合作 VS 1 个 Boss，不是 PvP）
-   ─────────────────────────────────────────────────────
-   玩家之间的移动/瞄准/开火/技能/下坠倒地/救援，跟
-   TeamBattleArena 是同一套逻辑（复用同一套 broadcast 权威
-   模型），区别只在于"敌人"从"另一支队伍"换成了"一个 Boss"。
-
-   Boss 没有自己的客户端，所以没法像玩家一样"自己的血量自己
-   权威"。这里用房主（room.host_id）的客户端本地跑 Boss AI，
-   作为 Boss 位置/HP/攻击阶段的唯一权威：
-   - 房主每帧计算 Boss 的移动/攻击/阶段，广播 'bossState'
-     给其他人，其他人只负责显示（位置做插值）
-   - 任何玩家的子弹打中 Boss（本地按最新一次收到的 Boss 坐标
-     判定）都广播 'bossHit'，只有房主的监听器会真正扣 Boss HP
-   - Boss 打玩家复用玩家之间已有的 'hit' 事件（targetId +
-     damage + push），伤害算法/Shield/Reflect 判定完全不用
-     重写一遍 —— 唯一区别是 Reflect 反弹的对象从"目标玩家"
-     变成"用 damageBoss() 直接扣 Boss 血"
-
-   Boss 三个阶段（按剩余 HP % 切换，威胁递增）：
-     phase1  100% → 70%   只有近身普通攻击
-     phase2   70% → 40%   解锁 Ground Smash / Charge / AOE，攻速变快
-     phase3   40% →  0%   同样三个技能，但更快、伤害更高、
-                          Ground Smash 会同时出现多个红圈
-===================================================== */
-
 const HIT_RADIUS = 20
 const BOSS_HIT_RADIUS = 55
 const STATE_BROADCAST_MS = 70
@@ -99,7 +73,6 @@ function spawnFor(map, idx) {
   }
 }
 
-/* 生成下一次特殊攻击的"预警"数据：类型 + 危险区域 + 开始/结算时间 */
 function buildTelegraph(phase, bossPos, targets, cfg, now) {
   const types = ['groundSmash', 'charge', 'aoe']
   const type = types[Math.floor(Math.random() * types.length)]
@@ -130,7 +103,6 @@ function buildTelegraph(phase, bossPos, targets, cfg, now) {
   }
 }
 
-/* 结算一次特殊攻击的伤害：谁站在危险区域/冲锋路径里就挨打 */
 function resolveTelegraphDamage(telegraph, targets, cfg, hitPlayer, addLog) {
   const dmg = Math.round((telegraph.type === 'charge' ? 22 : telegraph.type === 'aoe' ? 26 : 30) * cfg.damageMultiplier)
 
@@ -159,9 +131,6 @@ function resolveTelegraphDamage(telegraph, targets, cfg, hitPlayer, addLog) {
   if (hitAnyone) addLog(telegraph.type === 'aoe' ? '🌋 Boss 的范围攻击命中了！' : '💥 Boss 地面猛击命中了！')
 }
 
-/* =====================================================
-   小组件
-===================================================== */
 function CoopFighterAvatar({ x, y, angle, color, emoji, isSelf, downed, eliminated, isFlashing, flashColor }) {
   if (eliminated) return null
   return (
@@ -202,15 +171,32 @@ function BossAvatar({ x, y, phase }) {
   )
 }
 
-/* =====================================================
-   Boss Raid 核心组件
-===================================================== */
 export default function BossRaidArena({ room, players, warrior, session, onBack, map, onMatchEnd }) {
   const myId = session.user.id
   const activeMap = map || room?.map_data || BUILTIN_MAPS[0]
+  const mapPxW = activeMap.width * activeMap.tileSize
+  const mapPxH = activeMap.height * activeMap.tileSize
   const orderedPlayers = players
   const isHost = room?.host_id === myId
   const myIndex = Math.max(0, orderedPlayers.findIndex((p) => p.user_id === myId))
+
+  const MAP_SCALE = 0.7
+  const [mapOffset, setMapOffset] = useState({ x: 0, y: 0 })
+  const mapOffsetRef = useRef({ x: 0, y: 0 })
+
+  useEffect(() => {
+    const computeOffset = () => {
+      const offset = {
+        x: (window.innerWidth - mapPxW * MAP_SCALE) / 2,
+        y: (window.innerHeight - mapPxH * MAP_SCALE) / 2,
+      }
+      mapOffsetRef.current = offset
+      setMapOffset(offset)
+    }
+    computeOffset()
+    window.addEventListener('resize', computeOffset)
+    return () => window.removeEventListener('resize', computeOffset)
+  }, [mapPxW, mapPxH])
 
   const myWarrior = warrior
   const classConfig = Classes[myWarrior.outfit] || Classes.warrior
@@ -268,16 +254,15 @@ export default function BossRaidArena({ room, players, warrior, session, onBack,
   const [damageDealt, setDamageDealt] = useState(0)
   const [revives, setRevives] = useState(0)
 
-  const [matchPhase, setMatchPhase] = useState('countdown') // countdown -> fighting -> ended
+  const [matchPhase, setMatchPhase] = useState('countdown')
   const matchPhaseRef = useRef('countdown')
   useEffect(() => { matchPhaseRef.current = matchPhase }, [matchPhase])
-  const [matchResult, setMatchResult] = useState(null) // 'win' | 'lose'
+  const [matchResult, setMatchResult] = useState(null)
   const matchEndedRef = useRef(false)
 
   const revealUntilRef = useRef(0)
   const [myConcealed, setMyConcealed] = useState(false)
 
-  /* ---------------- refs ---------------- */
   const meRef = useRef(me)
   const othersRef = useRef(others)
   const projectilesRef = useRef(projectiles)
@@ -339,15 +324,11 @@ export default function BossRaidArena({ room, players, warrior, session, onBack,
     })
   }, [broadcast, activeMap])
 
-  /* =========================================================
-     失败/胜利判定
-  ========================================================= */
   const checkRaidFailed = useCallback(() => {
     if (matchEndedRef.current) return
     if (!isHost) return
     if (!orderedPlayers.length) return
 
-    // 房主必须先收到所有玩家的状态，避免刚开局/网络延迟时误判全队阵亡
     const allStatesKnown = orderedPlayers.every((p) => {
       const f = p.user_id === myId
         ? meRef.current
@@ -357,8 +338,6 @@ export default function BossRaidArena({ room, players, warrior, session, onBack,
 
     if (!allStatesKnown) return
 
-    // DOWNED 也代表暂时无法继续战斗。
-    // 所以如果所有玩家都是 DOWNED 或 ELIMINATED，立即结束 RAID。
     const hasAlivePlayer = orderedPlayers.some((p) => {
       const f = p.user_id === myId
         ? meRef.current
@@ -389,9 +368,6 @@ export default function BossRaidArena({ room, players, warrior, session, onBack,
     addLog('🏆 BOSS DEFEATED！')
   }, [addLog])
 
-  /* =========================================================
-     承受伤害（来自 Boss）：本地永远是自己血量/存活状态的权威
-  ========================================================= */
   const applyIncomingHit = useCallback((payload) => {
     if (matchEndedRef.current || meRef.current.eliminated || meRef.current.downed) return
     const now = Date.now()
@@ -416,8 +392,8 @@ export default function BossRaidArena({ room, players, warrior, session, onBack,
       const newHp = Math.max(0, prev.hp - finalDamage)
       const pushX = payload.pushX || 0
       const pushY = payload.pushY || 0
-      const nextX = Math.max(20, Math.min(window.innerWidth - 20, prev.x + pushX))
-      const nextY = Math.max(20, Math.min(window.innerHeight - 20, prev.y + pushY))
+      const nextX = Math.max(20, Math.min(mapPxW - 20, prev.x + pushX))
+      const nextY = Math.max(20, Math.min(mapPxH - 20, prev.y + pushY))
 
       if (newHp === 0 && !prev.downed) {
         addLog('🩸 你被 Boss 打倒了！等待队友救援（' + (BLEED_OUT_MS / 1000) + '秒内）')
@@ -437,7 +413,6 @@ export default function BossRaidArena({ room, players, warrior, session, onBack,
     }
   }, [addLog, addDamageText, broadcastOwnState])
 
-  /* 被队友救起 */
   const applyRevive = useCallback(() => {
     if (matchEndedRef.current || !meRef.current.downed || meRef.current.eliminated) return
     setMe((prev) => ({ ...prev, downed: false, hp: Math.round(prev.maxHp * REVIVE_HP_RATIO) }))
@@ -445,7 +420,6 @@ export default function BossRaidArena({ room, players, warrior, session, onBack,
     setTimeout(broadcastOwnState, 0)
   }, [addLog, broadcastOwnState])
 
-  /* Boss 打某个玩家：自己就直接本地结算，其他人走 broadcast('hit', ...) */
   const hitPlayer = useCallback((targetId, damage, pushX, pushY) => {
     if (targetId === myId) {
       applyIncomingHit({ damage, pushX, pushY, senderId: 'boss' })
@@ -454,7 +428,6 @@ export default function BossRaidArena({ room, players, warrior, session, onBack,
     }
   }, [myId, applyIncomingHit, broadcast])
 
-  /* 玩家打 Boss：只广播，只有房主的监听器会真的扣 Boss HP */
   const damageBoss = useCallback((amount) => {
     broadcast('bossHit', { damage: amount })
     if (isHost) {
@@ -472,9 +445,6 @@ export default function BossRaidArena({ room, players, warrior, session, onBack,
     addLog('⚔️ 命中 Boss，造成 ' + damage + ' 点伤害')
   }, [addDamageText, addLog])
 
-  /* =========================================================
-     Realtime 频道
-  ========================================================= */
   useEffect(() => {
     const channel = supabase.channel('pvp-arena-' + room.id, {
       config: { broadcast: { self: false } },
@@ -561,9 +531,6 @@ export default function BossRaidArena({ room, players, warrior, session, onBack,
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [room.id, applyIncomingHit, applyRevive, isHost, finishRaidWin])
 
-  /* =========================================================
-     攻击（子弹/光束逻辑跟 1v1、2v2 完全一样，命中判定对象换成 Boss）
-  ========================================================= */
   const spawnProjectile = useCallback((angle) => {
     markShooterRevealed(revealUntilRef)
     const cur = meRef.current
@@ -645,9 +612,6 @@ export default function BossRaidArena({ room, players, warrior, session, onBack,
     setTimeout(() => broadcast('skill', { active: false }), skillConfig.durationMs)
   }, [skillConfig, addLog, broadcast])
 
-  /* =========================================================
-     重开一局
-  ========================================================= */
   const resetMatch = useCallback(() => {
     const pos = spawnFor(activeMap, myIndex)
     setMe({ x: pos.x, y: pos.y, angle: 0, hp: classConfig.hp, maxHp: classConfig.hp, downed: false, eliminated: false, downedAt: 0 })
@@ -692,9 +656,6 @@ export default function BossRaidArena({ room, players, warrior, session, onBack,
     broadcast('restart', {})
   }, [resetMatch, broadcast])
 
-  /* =========================================================
-     输入：键盘（移动 + 冲刺 + Q 技能 + F 救援）
-  ========================================================= */
   useEffect(() => {
     const handleKeyDown = (e) => {
       if (matchPhaseRef.current !== 'fighting') return
@@ -731,7 +692,9 @@ export default function BossRaidArena({ room, players, warrior, session, onBack,
   useEffect(() => {
     const handleMouseMove = (e) => {
       if (meRef.current.downed || meRef.current.eliminated) return
-      setMe((prev) => ({ ...prev, angle: Math.atan2(e.clientY - prev.y, e.clientX - prev.x) }))
+      const worldX = (e.clientX - mapOffsetRef.current.x) / MAP_SCALE
+      const worldY = (e.clientY - mapOffsetRef.current.y) / MAP_SCALE
+      setMe((prev) => ({ ...prev, angle: Math.atan2(worldY - prev.y, worldX - prev.x) }))
     }
     const handleMouseDown = (e) => {
       if (e.button !== 0) return
@@ -754,9 +717,6 @@ export default function BossRaidArena({ room, players, warrior, session, onBack,
     }
   }, [performAttack, weaponConfig.mode])
 
-  /* =========================================================
-     主循环（玩家侧：移动/子弹/救援/流血倒计时/广播），所有客户端都跑
-  ========================================================= */
   useEffect(() => {
     if (matchPhase !== 'fighting') return
 
@@ -787,8 +747,8 @@ export default function BossRaidArena({ room, players, warrior, session, onBack,
           const len = Math.sqrt(dx * dx + dy * dy)
           dx /= len
           dy /= len
-          let nx = Math.max(20, Math.min(window.innerWidth - 20, cur.x + dx * speed))
-          let ny = Math.max(20, Math.min(window.innerHeight - 20, cur.y + dy * speed))
+          let nx = Math.max(20, Math.min(mapPxW - 20, cur.x + dx * speed))
+          let ny = Math.max(20, Math.min(mapPxH - 20, cur.y + dy * speed))
           const resolved = resolveWallCollision(activeMap, nx, ny, 18)
           nx = resolved.x
           ny = resolved.y
@@ -796,7 +756,6 @@ export default function BossRaidArena({ room, players, warrior, session, onBack,
         }
       }
 
-      // 队友位置插值
       setOthers((prev) => {
         const next = { ...prev }
         Object.keys(next).forEach((id) => {
@@ -811,7 +770,6 @@ export default function BossRaidArena({ room, players, warrior, session, onBack,
         return next
       })
 
-      // 非房主：Boss 位置插值
       if (!isHost) {
         setBoss((prev) => ({
           ...prev,
@@ -820,12 +778,11 @@ export default function BossRaidArena({ room, players, warrior, session, onBack,
         }))
       }
 
-      // 我方子弹：命中 Boss —— 先结算旧子弹
       const remaining = []
       for (const p of projectilesRef.current) {
         const nx = p.x + Math.cos(p.angle) * p.speed
         const ny = p.y + Math.sin(p.angle) * p.speed
-        const inBounds = nx > 0 && nx < window.innerWidth && ny > 0 && ny < window.innerHeight
+        const inBounds = nx > 0 && nx < mapPxW && ny > 0 && ny < mapPxH
         const wallHit = inBounds && isBulletBlocked(activeMap, p.x, p.y, nx, ny).blocked
         if (wallHit) continue
 
@@ -844,7 +801,6 @@ export default function BossRaidArena({ room, players, warrior, session, onBack,
       }
       setProjectiles(remaining)
 
-      // 连发武器 —— 放在旧子弹结算之后再追加新子弹
       if (canAct && currentWeapon.mode === 'auto' && mouseDown.current && !matchEndedRef.current) {
         const interval = currentWeapon.cooldown * (currentClass.attackSpeedMultiplier || 1)
         if (now - lastAutoFireAt.current >= interval) {
@@ -857,7 +813,6 @@ export default function BossRaidArena({ room, players, warrior, session, onBack,
         .map((p) => ({ ...p, x: p.x + Math.cos(p.angle) * p.speed, y: p.y + Math.sin(p.angle) * p.speed }))
         .filter((p) => Date.now() - p.spawnedAt < 3000))
 
-      // 救援：长按 F，靠近倒地队友即可救起
       if (canAct && keys.current['f']) {
         const teammates = orderedPlayers.filter((p) => p.user_id !== myId)
         let nearestId = null
@@ -890,7 +845,6 @@ export default function BossRaidArena({ room, players, warrior, session, onBack,
         setReviveProgress(null)
       }
 
-      // 倒地流血倒计时
       if (cur.downed && !cur.eliminated && now - cur.downedAt > BLEED_OUT_MS) {
         setMe((prev) => (prev.downed && !prev.eliminated ? { ...prev, downed: false, eliminated: true } : prev))
         addLog('💀 你流血过多，没能撑到队友赶来...')
@@ -922,9 +876,6 @@ export default function BossRaidArena({ room, players, warrior, session, onBack,
     myId, orderedPlayers, checkRaidFailed, reviveProgress, isHost,
   ])
 
-  /* =========================================================
-     Boss AI 循环：只有房主的客户端跑，是 Boss 位置/HP/攻击的唯一权威
-  ========================================================= */
   useEffect(() => {
     if (!isHost || matchPhase !== 'fighting') return
 
@@ -1012,9 +963,6 @@ export default function BossRaidArena({ room, players, warrior, session, onBack,
     return () => cancelAnimationFrame(bossAiFrameRef.current)
   }, [isHost, matchPhase, orderedPlayers, myId, broadcast, finishRaidWin, addLog, hitPlayer, activeMap])
 
-  /* =========================================================
-     渲染
-  ========================================================= */
   const myFlashActive = flash?.who === 'me' && Date.now() < flash.until
   const skillReady = skillConfig && Date.now() >= skillCooldownUntil
   const skillActiveNow = skillState.active && Date.now() < skillState.until
@@ -1029,16 +977,131 @@ export default function BossRaidArena({ room, players, warrior, session, onBack,
       style={{
         position: 'fixed', top: 0, left: 0, width: '100vw', height: '100vh',
         backgroundColor: '#0c0505',
-        backgroundImage: 'linear-gradient(rgba(255,255,255,0.03) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.03) 1px, transparent 1px)',
-        backgroundSize: '50px 50px',
         overflow: 'hidden', userSelect: 'none', cursor: 'crosshair', zIndex: 9999,
       }}
     >
-      <div style={{ position: 'absolute', top: 0, left: 0, zIndex: 1 }}>
-        <MapRenderer map={activeMap} />
+      {/* 摄像机 viewport：地图 + 所有世界坐标物体在同一层，固定居中显示 */}
+      <div style={{ position: 'absolute', inset: 0, overflow: 'hidden' }}>
+        <div style={{ position: 'absolute', top: 0, left: 0, transform: `translate(${mapOffset.x}px, ${mapOffset.y}px) scale(${MAP_SCALE})`, transformOrigin: '0 0' }}>
+          <MapRenderer map={activeMap} />
+
+          {/* 地图边界：亮红色描边 */}
+          <div style={{
+            position: 'absolute', left: 0, top: 0, width: mapPxW, height: mapPxH,
+            border: '4px solid #ff2e2e',
+            boxShadow: '0 0 20px 4px rgba(255,46,46,0.6), inset 0 0 16px 4px rgba(255,46,46,0.25)',
+            pointerEvents: 'none', zIndex: 5,
+          }} />
+
+          {/* Boss 危险区域预警 */}
+          {boss.telegraph && !boss.telegraph.resolved && boss.telegraph.type !== 'charge' && boss.telegraph.zones.map((z, i) => {
+            const progress = Math.min(1, (Date.now() - boss.telegraph.startedAt) / (boss.telegraph.resolveAt - boss.telegraph.startedAt))
+            return (
+              <div key={i} style={{
+                position: 'absolute', left: z.x, top: z.y, width: z.radius * 2, height: z.radius * 2,
+                transform: 'translate(-50%, -50%)', borderRadius: '50%',
+                border: '3px solid rgba(255,40,40,0.9)', background: `rgba(255,0,0,${0.12 + progress * 0.25})`,
+                zIndex: 7, pointerEvents: 'none',
+              }} />
+            )
+          })}
+          {boss.telegraph && !boss.telegraph.resolved && boss.telegraph.type === 'charge' && (() => {
+            const dx = boss.telegraph.targetX - boss.telegraph.fromX
+            const dy = boss.telegraph.targetY - boss.telegraph.fromY
+            const len = Math.hypot(dx, dy)
+            const angle = Math.atan2(dy, dx)
+            return (
+              <div style={{
+                position: 'absolute', left: boss.telegraph.fromX, top: boss.telegraph.fromY, width: len, height: BOSS_CHARGE_HIT_RADIUS * 2,
+                transform: `translateY(-50%) rotate(${angle}rad)`, transformOrigin: '0 50%',
+                background: 'rgba(255,40,40,0.22)', borderTop: '2px dashed rgba(255,60,60,0.8)', borderBottom: '2px dashed rgba(255,60,60,0.8)',
+                zIndex: 7, pointerEvents: 'none',
+              }} />
+            )
+          })()}
+
+          {/* Boss */}
+          {boss.hp > 0 && <BossAvatar x={boss.x} y={boss.y} phase={boss.phase} />}
+
+          {/* 我方角色 */}
+          <CoopFighterAvatar x={me.x} y={me.y} angle={me.angle} color={classConfig.color} emoji={outfits[myWarrior.outfit] || '🧑‍⚔️'} isSelf downed={me.downed} eliminated={me.eliminated} isFlashing={myFlashActive} flashColor={flash?.color} />
+
+          {/* 队友 */}
+          {Object.values(others).map((f) => {
+            const otherWarrior = f.warrior || {}
+            const otherClass = Classes[otherWarrior.outfit] || Classes.warrior
+            const otherFlashing = flash?.who === f.id && Date.now() < flash.until
+            return (
+              <CoopFighterAvatar
+                key={f.id} x={f.x} y={f.y} angle={f.angle} color={otherClass.color} emoji={outfits[otherWarrior.outfit] || '🧑‍⚔️'}
+                isSelf={false} downed={f.downed} eliminated={f.eliminated} isFlashing={otherFlashing} flashColor={flash?.color}
+              />
+            )
+          })}
+
+          {/* 我方技能光环 */}
+          {skillActiveNow && (
+            <div style={{
+              position: 'absolute', left: me.x, top: me.y, width: 64, height: 64, transform: 'translate(-50%, -50%)', borderRadius: '50%',
+              border: skillState.type === 'shield' ? '3px solid #3ea6ff' : '3px dashed #ff4d4d',
+              boxShadow: skillState.type === 'shield' ? '0 0 18px 4px rgba(62,166,255,0.7)' : '0 0 18px 4px rgba(255,77,77,0.7)',
+              pointerEvents: 'none', zIndex: 9,
+            }} />
+          )}
+
+          {/* 救援进度条 */}
+          {reviveProgress && others[reviveProgress.targetId] && (
+            <div style={{ position: 'absolute', left: others[reviveProgress.targetId].x, top: others[reviveProgress.targetId].y - 40, transform: 'translate(-50%, -50%)', width: 80, zIndex: 20, pointerEvents: 'none' }}>
+              <div style={{ fontSize: 10, color: '#fff', textAlign: 'center', marginBottom: 2, textShadow: '0 0 3px #000' }}>REVIVING…</div>
+              <div style={{ width: '100%', height: 6, background: '#333', borderRadius: 3, overflow: 'hidden' }}>
+                <div style={{ width: (reviveProgress.progress * 100) + '%', height: '100%', background: '#2ecc71' }} />
+              </div>
+            </div>
+          )}
+
+          {/* 我方子弹 */}
+          {projectiles.map((p) => (
+            <div key={p.id} style={{ position: 'absolute', left: p.x, top: p.y, width: p.size * 2, height: p.size * 2, borderRadius: '50%', backgroundColor: p.color, boxShadow: `0 0 5px ${p.color}`, transform: 'translate(-50%, -50%)', zIndex: 8 }} />
+          ))}
+
+          {/* 队友子弹（视觉） */}
+          {incomingProjectiles.map((p) => (
+            <div key={p.id} style={{ position: 'absolute', left: p.x, top: p.y, width: p.size * 2, height: p.size * 2, borderRadius: '50%', backgroundColor: p.color, boxShadow: `0 0 5px ${p.color}`, transform: 'translate(-50%, -50%)', zIndex: 8, opacity: 0.85 }} />
+          ))}
+
+          {/* 光束 */}
+          {beams.filter((b) => Date.now() < b.until).map((b) => {
+            const dx = b.x2 - b.x1
+            const dy = b.y2 - b.y1
+            const length = Math.hypot(dx, dy)
+            const angle = Math.atan2(dy, dx)
+            return (
+              <div key={b.id} style={{ position: 'absolute', left: b.x1, top: b.y1, width: length, height: 3, background: b.color, boxShadow: `0 0 8px ${b.color}`, transform: `rotate(${angle}rad)`, transformOrigin: '0 50%', opacity: 0.9, zIndex: 9, pointerEvents: 'none' }} />
+            )
+          })}
+
+          {/* 爆炸 */}
+          {explosions.filter((e) => Date.now() < e.until).map((e) => {
+            const progress = 1 - (e.until - Date.now()) / 400
+            const size = e.radius * 2 * (0.5 + progress * 0.6)
+            return (
+              <div key={e.id} style={{ position: 'absolute', left: e.x, top: e.y, width: size, height: size, borderRadius: '50%', background: 'radial-gradient(circle, rgba(255,220,120,1) 0%, rgba(255,100,30,0.9) 40%, rgba(192,57,43,0) 100%)', transform: 'translate(-50%, -50%)', opacity: 1 - progress, pointerEvents: 'none', zIndex: 15 }} />
+            )
+          })}
+
+          {/* 伤害数字 */}
+          {damageTexts.filter((d) => Date.now() < d.until).map((d) => {
+            const progress = 1 - (d.until - Date.now()) / 800
+            return (
+              <div key={d.id} style={{ position: 'absolute', left: d.x, top: d.y - progress * 40, transform: 'translate(-50%, -50%)', color: d.color, fontWeight: 'bold', fontSize: 18, opacity: 1 - progress, textShadow: '0 0 4px rgba(0,0,0,0.8)', zIndex: 20, pointerEvents: 'none' }}>
+                {d.text}
+              </div>
+            )
+          })}
+        </div>
       </div>
 
-      {/* Boss HP 大血条（置顶居中） */}
+      {/* Boss HP 大血条 */}
       <div style={{ position: 'absolute', top: 20, left: '50%', transform: 'translateX(-50%)', zIndex: 100, width: 460, textAlign: 'center' }}>
         <div style={{ fontSize: 14, fontWeight: 'bold', color: '#ff6b6b', marginBottom: 4, textShadow: '0 0 6px #000' }}>
           👹 BOSS — {phaseCfg.label}
@@ -1075,7 +1138,7 @@ export default function BossRaidArena({ room, players, warrior, session, onBack,
         )}
       </div>
 
-      {/* 队伍状态条（右上角） */}
+      {/* 队伍状态条 */}
       <div style={{ position: 'absolute', top: 20, right: 20, zIndex: 100, display: 'flex', flexDirection: 'column', gap: 8 }}>
         {teammates.map((p) => {
           const f = others[p.user_id]
@@ -1092,112 +1155,6 @@ export default function BossRaidArena({ room, players, warrior, session, onBack,
           )
         })}
       </div>
-
-      {/* Boss 危险区域预警 */}
-      {boss.telegraph && !boss.telegraph.resolved && boss.telegraph.type !== 'charge' && boss.telegraph.zones.map((z, i) => {
-        const progress = Math.min(1, (Date.now() - boss.telegraph.startedAt) / (boss.telegraph.resolveAt - boss.telegraph.startedAt))
-        return (
-          <div key={i} style={{
-            position: 'absolute', left: z.x, top: z.y, width: z.radius * 2, height: z.radius * 2,
-            transform: 'translate(-50%, -50%)', borderRadius: '50%',
-            border: '3px solid rgba(255,40,40,0.9)', background: `rgba(255,0,0,${0.12 + progress * 0.25})`,
-            zIndex: 7, pointerEvents: 'none',
-          }} />
-        )
-      })}
-      {boss.telegraph && !boss.telegraph.resolved && boss.telegraph.type === 'charge' && (() => {
-        const dx = boss.telegraph.targetX - boss.telegraph.fromX
-        const dy = boss.telegraph.targetY - boss.telegraph.fromY
-        const len = Math.hypot(dx, dy)
-        const angle = Math.atan2(dy, dx)
-        return (
-          <div style={{
-            position: 'absolute', left: boss.telegraph.fromX, top: boss.telegraph.fromY, width: len, height: BOSS_CHARGE_HIT_RADIUS * 2,
-            transform: `translateY(-50%) rotate(${angle}rad)`, transformOrigin: '0 50%',
-            background: 'rgba(255,40,40,0.22)', borderTop: '2px dashed rgba(255,60,60,0.8)', borderBottom: '2px dashed rgba(255,60,60,0.8)',
-            zIndex: 7, pointerEvents: 'none',
-          }} />
-        )
-      })()}
-
-      {/* Boss */}
-      {boss.hp > 0 && <BossAvatar x={boss.x} y={boss.y} phase={boss.phase} />}
-
-      {/* 我方角色 */}
-      <CoopFighterAvatar x={me.x} y={me.y} angle={me.angle} color={classConfig.color} emoji={outfits[myWarrior.outfit] || '🧑‍⚔️'} isSelf downed={me.downed} eliminated={me.eliminated} isFlashing={myFlashActive} flashColor={flash?.color} />
-
-      {/* 队友 */}
-      {Object.values(others).map((f) => {
-        const otherWarrior = f.warrior || {}
-        const otherClass = Classes[otherWarrior.outfit] || Classes.warrior
-        const otherFlashing = flash?.who === f.id && Date.now() < flash.until
-        return (
-          <CoopFighterAvatar
-            key={f.id} x={f.x} y={f.y} angle={f.angle} color={otherClass.color} emoji={outfits[otherWarrior.outfit] || '🧑‍⚔️'}
-            isSelf={false} downed={f.downed} eliminated={f.eliminated} isFlashing={otherFlashing} flashColor={flash?.color}
-          />
-        )
-      })}
-
-      {/* 我方技能光环 */}
-      {skillActiveNow && (
-        <div style={{
-          position: 'absolute', left: me.x, top: me.y, width: 64, height: 64, transform: 'translate(-50%, -50%)', borderRadius: '50%',
-          border: skillState.type === 'shield' ? '3px solid #3ea6ff' : '3px dashed #ff4d4d',
-          boxShadow: skillState.type === 'shield' ? '0 0 18px 4px rgba(62,166,255,0.7)' : '0 0 18px 4px rgba(255,77,77,0.7)',
-          pointerEvents: 'none', zIndex: 9,
-        }} />
-      )}
-
-      {/* 救援进度条 */}
-      {reviveProgress && others[reviveProgress.targetId] && (
-        <div style={{ position: 'absolute', left: others[reviveProgress.targetId].x, top: others[reviveProgress.targetId].y - 40, transform: 'translate(-50%, -50%)', width: 80, zIndex: 20, pointerEvents: 'none' }}>
-          <div style={{ fontSize: 10, color: '#fff', textAlign: 'center', marginBottom: 2, textShadow: '0 0 3px #000' }}>REVIVING…</div>
-          <div style={{ width: '100%', height: 6, background: '#333', borderRadius: 3, overflow: 'hidden' }}>
-            <div style={{ width: (reviveProgress.progress * 100) + '%', height: '100%', background: '#2ecc71' }} />
-          </div>
-        </div>
-      )}
-
-      {/* 我方子弹 */}
-      {projectiles.map((p) => (
-        <div key={p.id} style={{ position: 'absolute', left: p.x, top: p.y, width: p.size * 2, height: p.size * 2, borderRadius: '50%', backgroundColor: p.color, boxShadow: `0 0 5px ${p.color}`, transform: 'translate(-50%, -50%)', zIndex: 8 }} />
-      ))}
-
-      {/* 队友子弹（视觉） */}
-      {incomingProjectiles.map((p) => (
-        <div key={p.id} style={{ position: 'absolute', left: p.x, top: p.y, width: p.size * 2, height: p.size * 2, borderRadius: '50%', backgroundColor: p.color, boxShadow: `0 0 5px ${p.color}`, transform: 'translate(-50%, -50%)', zIndex: 8, opacity: 0.85 }} />
-      ))}
-
-      {/* 光束 */}
-      {beams.filter((b) => Date.now() < b.until).map((b) => {
-        const dx = b.x2 - b.x1
-        const dy = b.y2 - b.y1
-        const length = Math.hypot(dx, dy)
-        const angle = Math.atan2(dy, dx)
-        return (
-          <div key={b.id} style={{ position: 'absolute', left: b.x1, top: b.y1, width: length, height: 3, background: b.color, boxShadow: `0 0 8px ${b.color}`, transform: `rotate(${angle}rad)`, transformOrigin: '0 50%', opacity: 0.9, zIndex: 9, pointerEvents: 'none' }} />
-        )
-      })}
-
-      {/* 爆炸 */}
-      {explosions.filter((e) => Date.now() < e.until).map((e) => {
-        const progress = 1 - (e.until - Date.now()) / 400
-        const size = e.radius * 2 * (0.5 + progress * 0.6)
-        return (
-          <div key={e.id} style={{ position: 'absolute', left: e.x, top: e.y, width: size, height: size, borderRadius: '50%', background: 'radial-gradient(circle, rgba(255,220,120,1) 0%, rgba(255,100,30,0.9) 40%, rgba(192,57,43,0) 100%)', transform: 'translate(-50%, -50%)', opacity: 1 - progress, pointerEvents: 'none', zIndex: 15 }} />
-        )
-      })}
-
-      {/* 伤害数字 */}
-      {damageTexts.filter((d) => Date.now() < d.until).map((d) => {
-        const progress = 1 - (d.until - Date.now()) / 800
-        return (
-          <div key={d.id} style={{ position: 'absolute', left: d.x, top: d.y - progress * 40, transform: 'translate(-50%, -50%)', color: d.color, fontWeight: 'bold', fontSize: 18, opacity: 1 - progress, textShadow: '0 0 4px rgba(0,0,0,0.8)', zIndex: 20, pointerEvents: 'none' }}>
-            {d.text}
-          </div>
-        )
-      })}
 
       {/* 战斗日志 */}
       <div style={{ position: 'absolute', bottom: 20, left: 20, zIndex: 100, background: 'rgba(0,0,0,0.7)', padding: 15, borderRadius: 8, color: '#fff', maxWidth: 320 }}>
@@ -1219,7 +1176,6 @@ export default function BossRaidArena({ room, players, warrior, session, onBack,
         LEAVE MATCH
       </button>
 
-      {/* 结算画面 */}
       {matchPhase === 'ended' && (
         <div style={{
           position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)', zIndex: 200,
